@@ -4,15 +4,17 @@ CapsLock RS 是一个 Windows 平台的轻量键盘增强工具。它将 `CapsLo
 
 本项目不准备复刻一个包含搜索、翻译、计算器和剪贴板工作流的综合效率工具。它只专注于一件事：把 `CapsLock` 变成稳定、可配置、易扩展的键盘修饰层。
 
-项目目前处于早期开发阶段，但第一里程碑已经可以日常使用。
+项目目前处于早期开发阶段，里程碑 2 的通用键位与组合键模型已经可用。
 
 ## 当前功能
 
 - 使用 `WH_KEYBOARD_LL` 全局低级键盘钩子处理 CapsLock 组合键。
 - 使用 `SendInput` 模拟目标按键，并标记程序生成的事件以避免递归触发。
 - 支持 CapsLock+ 风格的 `[Keys]`、`caps_*` 和 `keyFunc_*` INI 配置。
-- 支持带次数参数的动作，例如 `keyFunc_moveUp(5)`。
-- 支持按词移动：`keyFunc_moveWordLeft` 和 `keyFunc_moveWordRight`。
+- 支持通用源组合键：`Ctrl`、`Alt`、`Shift`、`Win` 及左右版本可与常用键组合。
+- 支持三类输出动作：内置函数 `keyFunc_*`、目标单键 `keyTarget_*`、目标组合键 `keyCombo_*`。
+- 支持带次数参数的动作，例如 `keyFunc_moveUp(5)` 和 `keyFunc_selectUp(5)`。
+- 支持按词移动、选择、Home/End/PageUp/PageDown 和按词删除。
 - 支持单实例、后台运行、系统托盘、配置重载和打开日志。
 - 支持当前用户开机启动。
 - 可选以管理员身份运行，用于向管理员权限窗口发送按键。
@@ -49,7 +51,7 @@ cargo build --release
 target\release\capslock_rs.exe
 ```
 
-将 `capslock_rs.ini` 放在程序同目录并启动程序。Release 构建使用 Windows 子系统，不显示控制台窗口；运行状态和常用操作可通过系统托盘管理。
+将 `capslock_rs.ini` 放在程序同目录并启动程序。当前仓库根目录的 `capslock_rs.ini` 是保守默认配置；`examples/capslock_rs.example.ini` 提供更完整的里程碑 2 示例。Release 构建使用 Windows 子系统，不显示控制台窗口；运行状态和常用操作可通过系统托盘管理。
 
 开发与测试：
 
@@ -61,6 +63,8 @@ cargo build
 本项目目前仅支持 Windows。
 
 ## 配置
+
+当前使用的默认配置保持尽量保守，只启用基础移动、删除和按词移动。完整示例配置位于 `examples/capslock_rs.example.ini`，可以按需复制其中的映射到 `capslock_rs.ini`。
 
 默认配置示例：
 
@@ -84,6 +88,10 @@ caps_z=keyFunc_moveUp(5)
 caps_x=keyFunc_moveDown(5)
 caps_lalt_a=keyFunc_moveWordLeft
 caps_lalt_d=keyFunc_moveWordRight
+; caps_r=keyTarget_f5
+; caps_c=keyCombo_ctrl_c
+; caps_lalt_shift_j=keyFunc_selectDown
+; caps_u=keyFunc_selectUp(5)
 
 [ui]
 settings_backend = ini
@@ -97,22 +105,49 @@ settings_page = future
 3. 程序同目录下的 `capslock_rs.ini`。
 4. 开发环境中的项目根目录。
 
+`[Keys]` 的源组合键统一写成 `caps_<修饰键>_<按键>`。修饰键支持 `ctrl`、`lctrl`、`rctrl`、`alt`、`lalt`、`ralt`、`shift`、`lshift`、`rshift`、`win`、`lwin`、`rwin`，多个修饰键的顺序会自动标准化，例如 `caps_shift_lalt_j` 会保存为 `caps_lalt_shift_j`。
+
+常用按键覆盖字母、数字、方向键、`space`、`tab`、`enter`、`escape`、`backspace`、`delete`、`insert`、`home`、`end`、`page_up`、`page_down`、`f1` 到 `f24`、常见标点、数字小键盘和常用媒体键。
+
+完整示例文件覆盖基础移动、选择、目标单键、目标组合键、多修饰键源组合和媒体键：
+
+```ini
+; examples/capslock_rs.example.ini
+caps_shift_h=keyFunc_selectLeft
+caps_r=keyTarget_f5
+caps_m=keyTarget_media_play_pause
+caps_c=keyCombo_ctrl_c
+caps_ctrl_shift_h=keyCombo_ctrl_shift_left
+```
+
+动作值分为三类：
+
+| 配置值 | 作用 |
+| --- | --- |
+| `keyFunc_moveLeft(5)` | 执行内置函数，可带次数参数 |
+| `keyTarget_f5` | 输出单个目标按键 |
+| `keyCombo_ctrl_c` | 输出目标组合键 |
+
 当前支持的内置动作：
 
 | 配置值 | 作用 |
 | --- | --- |
-| `keyFunc_moveLeft(n)` | 向左移动 `n` 次 |
-| `keyFunc_moveRight(n)` | 向右移动 `n` 次 |
-| `keyFunc_moveUp(n)` | 向上移动 `n` 次 |
-| `keyFunc_moveDown(n)` | 向下移动 `n` 次 |
-| `keyFunc_moveWordLeft(n)` | 按词向左移动 `n` 次 |
-| `keyFunc_moveWordRight(n)` | 按词向右移动 `n` 次 |
+| `keyFunc_moveLeft(n)` / `keyFunc_moveRight(n)` | 左右移动 `n` 次 |
+| `keyFunc_moveUp(n)` / `keyFunc_moveDown(n)` | 上下移动 `n` 次 |
+| `keyFunc_moveWordLeft(n)` / `keyFunc_moveWordRight(n)` | 按词左右移动 `n` 次 |
+| `keyFunc_selectLeft(n)` / `keyFunc_selectRight(n)` | 左右选择 `n` 次 |
+| `keyFunc_selectUp(n)` / `keyFunc_selectDown(n)` | 上下选择 `n` 次 |
+| `keyFunc_selectWordLeft(n)` / `keyFunc_selectWordRight(n)` | 按词左右选择 `n` 次 |
+| `keyFunc_home(n)` / `keyFunc_end(n)` | Home 或 End `n` 次 |
+| `keyFunc_pageUp(n)` / `keyFunc_pageDown(n)` | PageUp 或 PageDown `n` 次 |
 | `keyFunc_enter(n)` | Enter `n` 次 |
 | `keyFunc_backspace(n)` | Backspace `n` 次 |
 | `keyFunc_delete(n)` | Delete `n` 次 |
+| `keyFunc_deleteWord(n)` | Ctrl + Backspace `n` 次 |
+| `keyFunc_forwardDeleteWord(n)` | Ctrl + Delete `n` 次 |
 | `keyFunc_doNothing` | 不执行动作 |
 
-省略参数时，次数默认为 `1`。
+省略参数时，次数默认为 `1`。无法识别的单条映射会被跳过并写入日志，不会导致整份配置失效。
 
 ## 管理员窗口
 
@@ -127,14 +162,12 @@ run_as_admin = true
 
 ## 项目方向
 
-后续开发以通用键位表达能力为核心：
+后续开发将转向界面与发布准备：
 
-- 扩大输入键和修饰键的覆盖范围，支持更自由的 CapsLock 起始组合键。
-- 支持输出单个目标按键、目标组合键和参数化内置函数。
-- 增加选择、移动、删除等通用编辑动作，例如 `selectUp(5)`。
 - 建立中文和英文界面资源，默认支持简体中文，并允许跟随系统或手动切换语言。
 - 开发 GUI 配置页，用可视化方式新增、编辑、校验和删除键位映射。
 - 后期以受控方式支持启动程序和执行外部脚本。
+- 完成许可证、CI、发布包和兼容性验证。
 
 完整路线见 [PLAN.md](./PLAN.md)。
 

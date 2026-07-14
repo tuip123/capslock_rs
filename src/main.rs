@@ -8,6 +8,7 @@ mod app;
 mod config;
 mod gui_settings;
 mod hook;
+mod keys;
 mod logging;
 mod startup;
 mod tray;
