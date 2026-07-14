@@ -341,6 +341,10 @@ impl KeyMapping {
 fn read_config_text(path: &Path) -> Result<String, String> {
     let bytes =
         fs::read(path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8(bytes[3..].to_vec())
+            .map_err(|error| format!("failed to decode {} as UTF-8: {error}", path.display()));
+    }
     if bytes.starts_with(&[0xFF, 0xFE]) {
         return decode_utf16_bytes(path, &bytes[2..], false);
     }
@@ -904,6 +908,25 @@ mod tests {
         assert_eq!(
             find_action(&config, "z"),
             Some(LayerAction::BuiltIn(BuiltInAction::MoveUp(5)))
+        );
+    }
+
+    #[test]
+    fn loads_utf8_bom_capslock_plus_ini() {
+        let path = std::env::temp_dir().join(format!(
+            "capslock_rs_utf8_bom_test_{}.ini",
+            std::process::id()
+        ));
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"[Keys]\ncaps_r=keyTarget_f5\n");
+
+        fs::write(&path, bytes).unwrap();
+        let config = Config::load(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            find_action(&config, "r"),
+            Some(LayerAction::KeyTap(parse_key_code("f5").unwrap()))
         );
     }
 
