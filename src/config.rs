@@ -1,13 +1,59 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File};
+use std::io::Write;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use windows_sys::Win32::Storage::FileSystem::{
+    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+};
 
 use crate::keys::{
     parse_capslock_combo_name, parse_combo_suffix, parse_key_code, KeyCode, KeyCombo,
 };
 use crate::logging;
 
+static SAVE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug)]
+pub struct ConfigParseResult {
+    pub config: Config,
+    pub validation: ConfigValidation,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ConfigValidation {
+    pub issues: Vec<ConfigIssue>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigIssue {
+    pub severity: ConfigIssueSeverity,
+    pub kind: ConfigIssueKind,
+    pub line: Option<usize>,
+    pub section: Option<String>,
+    pub key: Option<String>,
+    pub value: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigIssueSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigIssueKind {
+    Syntax,
+    InvalidValue,
+    InvalidMapping,
+    DuplicateMapping,
+    UnknownAction,
+}
 #[derive(Clone, Debug)]
 pub struct Config {
     pub general: GeneralConfig,
@@ -95,6 +141,162 @@ struct KeysSectionConfig {
     tap_capslock: Option<TapCapsLock>,
 }
 
+#[derive(Debug, Default)]
+struct IniDocument {
+    sections: BTreeMap<String, IniSection>,
+}
+
+#[derive(Debug, Default)]
+struct IniSection {
+    entries: Vec<IniEntry>,
+    values: BTreeMap<String, IniValue>,
+}
+
+#[derive(Clone, Debug)]
+struct IniEntry {
+    key: String,
+    value: String,
+    line_number: usize,
+}
+
+#[derive(Clone, Debug)]
+struct IniValue {
+    value: String,
+    line_number: usize,
+}
+
+#[derive(Debug)]
+struct IniParseError {
+    line_number: Option<usize>,
+    message: String,
+}
+
+impl IniDocument {
+    fn get(&self, section: &str) -> Option<&IniSection> {
+        self.sections.get(section)
+    }
+}
+
+impl ConfigParseResult {
+    pub fn into_config_result(self) -> Result<Config, String> {
+        if self.validation.has_errors() {
+            Err(self.validation.error_summary())
+        } else {
+            Ok(self.config)
+        }
+    }
+}
+
+impl ConfigValidation {
+    pub fn has_errors(&self) -> bool {
+        self.issues
+            .iter()
+            .any(|issue| issue.severity == ConfigIssueSeverity::Error)
+    }
+
+    #[allow(dead_code)]
+    pub fn has_warnings(&self) -> bool {
+        self.issues
+            .iter()
+            .any(|issue| issue.severity == ConfigIssueSeverity::Warning)
+    }
+
+    pub fn errors(&self) -> impl Iterator<Item = &ConfigIssue> {
+        self.issues
+            .iter()
+            .filter(|issue| issue.severity == ConfigIssueSeverity::Error)
+    }
+
+    #[allow(dead_code)]
+    pub fn warnings(&self) -> impl Iterator<Item = &ConfigIssue> {
+        self.issues
+            .iter()
+            .filter(|issue| issue.severity == ConfigIssueSeverity::Warning)
+    }
+
+    fn error(
+        &mut self,
+        kind: ConfigIssueKind,
+        line: Option<usize>,
+        section: Option<&str>,
+        key: Option<&str>,
+        value: Option<&str>,
+        message: impl Into<String>,
+    ) {
+        self.push(ConfigIssue::new(
+            ConfigIssueSeverity::Error,
+            kind,
+            line,
+            section,
+            key,
+            value,
+            message,
+        ));
+    }
+
+    fn warning(
+        &mut self,
+        kind: ConfigIssueKind,
+        line: Option<usize>,
+        section: Option<&str>,
+        key: Option<&str>,
+        value: Option<&str>,
+        message: impl Into<String>,
+    ) {
+        self.push(ConfigIssue::new(
+            ConfigIssueSeverity::Warning,
+            kind,
+            line,
+            section,
+            key,
+            value,
+            message,
+        ));
+    }
+
+    fn push(&mut self, issue: ConfigIssue) {
+        self.issues.push(issue);
+    }
+
+    fn error_summary(&self) -> String {
+        let messages: Vec<String> = self.errors().map(ConfigIssue::summary).collect();
+        if messages.is_empty() {
+            "config validation failed".to_string()
+        } else {
+            messages.join("; ")
+        }
+    }
+}
+
+impl ConfigIssue {
+    fn new(
+        severity: ConfigIssueSeverity,
+        kind: ConfigIssueKind,
+        line: Option<usize>,
+        section: Option<&str>,
+        key: Option<&str>,
+        value: Option<&str>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            severity,
+            kind,
+            line,
+            section: section.map(ToOwned::to_owned),
+            key: key.map(ToOwned::to_owned),
+            value: value.map(ToOwned::to_owned),
+            message: message.into(),
+        }
+    }
+
+    fn summary(&self) -> String {
+        match self.line {
+            Some(line) => format!("line {line}: {}", self.message),
+            None => self.message.clone(),
+        }
+    }
+}
+
 impl ConfigPaths {
     pub fn resolve() -> Result<Self, String> {
         let config_path = if let Ok(path) = env::var("CAPSLOCK_RS_CONFIG") {
@@ -180,50 +382,118 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
+        Self::load_with_validation(path)?.into_config_result()
+    }
+
+    pub fn load_with_validation(path: &Path) -> Result<ConfigParseResult, String> {
         let content = read_config_text(path)?;
-        Self::from_ini(&content)
+        Ok(Self::from_ini_with_validation(&content))
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+        let parent = config_parent_dir(path);
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+
+        let temp_path = temp_save_path(path);
+        if let Err(error) = write_temp_config(&temp_path, &self.to_ini_string()) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
         }
 
-        fs::write(path, self.to_ini_string())
-            .map_err(|error| format!("failed to write {}: {error}", path.display()))
+        if let Err(error) = replace_file(&temp_path, path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+
+        Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn from_ini(content: &str) -> Result<Self, String> {
-        let parsed = parse_ini(content)?;
+        Self::from_ini_with_validation(content).into_config_result()
+    }
+
+    pub fn from_ini_with_validation(content: &str) -> ConfigParseResult {
+        let mut validation = ConfigValidation::default();
+        let parsed = match parse_ini(content) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                validation.error(
+                    ConfigIssueKind::Syntax,
+                    error.line_number,
+                    None,
+                    None,
+                    None,
+                    error.message,
+                );
+                return ConfigParseResult {
+                    config: Self::default(),
+                    validation,
+                };
+            }
+        };
         let mut config = Self::default();
 
         if let Some(global) = parsed.get("global") {
-            config.general.start_with_windows =
-                read_bool(global, "autostart", config.general.start_with_windows)?;
+            config.general.start_with_windows = read_bool(
+                global,
+                "global",
+                "autostart",
+                config.general.start_with_windows,
+                &mut validation,
+            );
         }
 
         if let Some(general) = parsed.get("general") {
-            config.general.enabled = read_bool(general, "enabled", config.general.enabled)?;
+            config.general.enabled = read_bool(
+                general,
+                "general",
+                "enabled",
+                config.general.enabled,
+                &mut validation,
+            );
             config.general.start_with_windows = read_bool(
                 general,
+                "general",
                 "start_with_windows",
                 config.general.start_with_windows,
-            )?;
-            config.general.run_as_admin =
-                read_bool(general, "run_as_admin", config.general.run_as_admin)?;
-            config.general.show_tray_icon =
-                read_bool(general, "show_tray_icon", config.general.show_tray_icon)?;
-            if let Some(value) = general.get("tap_capslock") {
-                config.general.tap_capslock = parse_tap_capslock(value)?;
+                &mut validation,
+            );
+            config.general.run_as_admin = read_bool(
+                general,
+                "general",
+                "run_as_admin",
+                config.general.run_as_admin,
+                &mut validation,
+            );
+            config.general.show_tray_icon = read_bool(
+                general,
+                "general",
+                "show_tray_icon",
+                config.general.show_tray_icon,
+                &mut validation,
+            );
+            if let Some(value) = general.values.get("tap_capslock") {
+                match parse_tap_capslock(&value.value) {
+                    Ok(tap_capslock) => config.general.tap_capslock = tap_capslock,
+                    Err(error) => validation.error(
+                        ConfigIssueKind::InvalidValue,
+                        Some(value.line_number),
+                        Some("general"),
+                        Some("tap_capslock"),
+                        Some(&value.value),
+                        error,
+                    ),
+                }
             }
         }
 
         if let Some(layer) = parsed.get("layer.capslock") {
-            config.capslock_layer = parse_layer_section(layer);
+            config.capslock_layer = parse_layer_section(layer, &mut validation);
         }
 
-        if let Some(keys) = parse_capslock_plus_keys_section(content)? {
+        if let Some(keys) = parse_capslock_plus_keys_section(content, &mut validation) {
             if let Some(tap_capslock) = keys.tap_capslock {
                 config.general.tap_capslock = tap_capslock;
             }
@@ -231,18 +501,28 @@ impl Config {
         }
 
         if let Some(ui) = parsed.get("ui") {
-            if let Some(value) = ui.get("settings_backend") {
-                config.ui.settings_backend = value.clone();
+            if let Some(value) = ui.values.get("settings_backend") {
+                config.ui.settings_backend = value.value.clone();
             }
-            if let Some(value) = ui.get("settings_page") {
-                config.ui.settings_page = value.clone();
+            if let Some(value) = ui.values.get("settings_page") {
+                config.ui.settings_page = value.value.clone();
             }
-            if let Some(value) = ui.get("language") {
-                config.ui.language = Language::parse(value)?;
+            if let Some(value) = ui.values.get("language") {
+                match Language::parse(&value.value) {
+                    Ok(language) => config.ui.language = language,
+                    Err(error) => validation.error(
+                        ConfigIssueKind::InvalidValue,
+                        Some(value.line_number),
+                        Some("ui"),
+                        Some("language"),
+                        Some(&value.value),
+                        error,
+                    ),
+                }
             }
         }
 
-        Ok(config)
+        ConfigParseResult { config, validation }
     }
 
     pub fn to_ini_string(&self) -> String {
@@ -418,8 +698,8 @@ fn decode_utf16_bytes(path: &Path, bytes: &[u8], big_endian: bool) -> Result<Str
         .map_err(|error| format!("failed to decode {} as UTF-16: {error}", path.display()))
 }
 
-fn parse_ini(content: &str) -> Result<BTreeMap<String, BTreeMap<String, String>>, String> {
-    let mut sections: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+fn parse_ini(content: &str) -> Result<IniDocument, IniParseError> {
+    let mut document = IniDocument::default();
     let mut current_section = String::new();
 
     for (index, raw_line) in content.lines().enumerate() {
@@ -432,64 +712,115 @@ fn parse_ini(content: &str) -> Result<BTreeMap<String, BTreeMap<String, String>>
 
         if line.starts_with('[') {
             if !line.ends_with(']') {
-                return Err(format!("invalid section header at line {line_number}"));
+                return Err(IniParseError {
+                    line_number: Some(line_number),
+                    message: format!("invalid section header at line {line_number}"),
+                });
             }
 
             current_section = line[1..line.len() - 1].trim().to_ascii_lowercase();
-            sections.entry(current_section.clone()).or_default();
+            document
+                .sections
+                .entry(current_section.clone())
+                .or_default();
             continue;
         }
 
         let Some((key, value)) = line.split_once('=') else {
-            return Err(format!("invalid key/value at line {line_number}"));
+            return Err(IniParseError {
+                line_number: Some(line_number),
+                message: format!("invalid key/value at line {line_number}"),
+            });
         };
 
         let key = key.trim().to_ascii_lowercase();
-        let value = strip_inline_comment(value.trim())
-            .trim()
-            .to_ascii_lowercase();
-        sections
+        let value = strip_inline_comment(value.trim()).trim().to_string();
+        let section = document
+            .sections
             .entry(current_section.clone())
-            .or_default()
-            .insert(key, value);
+            .or_default();
+        section.entries.push(IniEntry {
+            key: key.clone(),
+            value: value.clone(),
+            line_number,
+        });
+        section.values.insert(key, IniValue { value, line_number });
     }
 
-    Ok(sections)
+    Ok(document)
 }
 
-fn parse_layer_section(layer: &BTreeMap<String, String>) -> Vec<KeyMapping> {
+fn parse_layer_section(layer: &IniSection, validation: &mut ConfigValidation) -> Vec<KeyMapping> {
     let mut mappings = Vec::new();
+    let mut seen_raw_keys = BTreeSet::new();
     let mut seen_sources = BTreeSet::new();
 
-    for (source, action_name) in layer {
-        let source = match parse_combo_suffix(source) {
+    for entry in &layer.entries {
+        if !seen_raw_keys.insert(entry.key.clone()) {
+            warn_duplicate_mapping(
+                validation,
+                entry.line_number,
+                "layer.capslock",
+                &entry.key,
+                &entry.value,
+                format!("duplicate [layer.capslock] mapping for {}", entry.key),
+            );
+            continue;
+        }
+
+        let source = match parse_combo_suffix(&entry.key) {
             Ok(source) => source,
             Err(error) => {
-                logging::log_line(format!(
-                    "skipping [layer.capslock] mapping {source}: {error}"
-                ));
+                warn_invalid_mapping(
+                    validation,
+                    entry.line_number,
+                    "layer.capslock",
+                    &entry.key,
+                    &entry.value,
+                    format!("invalid [layer.capslock] mapping {}: {error}", entry.key),
+                );
                 continue;
             }
         };
-        let action = match parse_layer_action(action_name) {
+        let action = match parse_layer_action(&entry.value) {
             Ok(Some(action)) => action,
             Ok(None) => continue,
             Err(error) => {
-                logging::log_line(format!(
-                    "skipping [layer.capslock] mapping {}: {error}",
-                    source.ini_suffix()
-                ));
+                warn_unknown_action(
+                    validation,
+                    entry.line_number,
+                    "layer.capslock",
+                    &entry.key,
+                    &entry.value,
+                    format!(
+                        "unknown action for [layer.capslock] mapping {}: {error}",
+                        source.ini_suffix()
+                    ),
+                );
                 continue;
             }
         };
 
-        push_mapping(&mut mappings, &mut seen_sources, source, action);
+        push_mapping(
+            &mut mappings,
+            &mut seen_sources,
+            source,
+            action,
+            validation,
+            entry.line_number,
+            "layer.capslock",
+            &entry.key,
+            &entry.value,
+        );
     }
 
     mappings
 }
 
-fn parse_capslock_plus_keys_section(content: &str) -> Result<Option<KeysSectionConfig>, String> {
+fn parse_capslock_plus_keys_section(
+    content: &str,
+    validation: &mut ConfigValidation,
+) -> Option<KeysSectionConfig> {
     let mut current_section = String::new();
     let mut mappings = Vec::new();
     let mut tap_capslock = None;
@@ -507,7 +838,15 @@ fn parse_capslock_plus_keys_section(content: &str) -> Result<Option<KeysSectionC
 
         if line.starts_with('[') {
             if !line.ends_with(']') {
-                return Err(format!("invalid section header at line {line_number}"));
+                validation.error(
+                    ConfigIssueKind::Syntax,
+                    Some(line_number),
+                    None,
+                    None,
+                    None,
+                    format!("invalid section header at line {line_number}"),
+                );
+                return None;
             }
             current_section = line[1..line.len() - 1].trim().to_ascii_lowercase();
             continue;
@@ -519,21 +858,45 @@ fn parse_capslock_plus_keys_section(content: &str) -> Result<Option<KeysSectionC
 
         found_keys_section = true;
         let Some((key, value)) = line.split_once('=') else {
-            return Err(format!("invalid key/value at line {line_number}"));
+            validation.error(
+                ConfigIssueKind::Syntax,
+                Some(line_number),
+                Some("keys"),
+                None,
+                None,
+                format!("invalid key/value at line {line_number}"),
+            );
+            return None;
         };
 
         let key = key.trim().to_ascii_lowercase();
-        let value = strip_inline_comment(value.trim())
-            .trim()
-            .to_ascii_lowercase();
+        let value = strip_inline_comment(value.trim()).trim().to_string();
 
         // Copied CapsLock+ configs often keep a later doNothing entry for the same key.
         if !seen_raw_keys.insert(key.clone()) {
+            warn_duplicate_mapping(
+                validation,
+                line_number,
+                "keys",
+                &key,
+                &value,
+                format!("duplicate [Keys] mapping for {key}"),
+            );
             continue;
         }
 
         if key == "press_caps" {
-            tap_capslock = Some(parse_key_func_tap_capslock(&value)?);
+            match parse_key_func_tap_capslock(&value) {
+                Ok(mode) => tap_capslock = Some(mode),
+                Err(error) => warn_unknown_action(
+                    validation,
+                    line_number,
+                    "keys",
+                    &key,
+                    &value,
+                    format!("unsupported press_caps action: {error}"),
+                ),
+            }
             continue;
         }
 
@@ -544,9 +907,14 @@ fn parse_capslock_plus_keys_section(content: &str) -> Result<Option<KeysSectionC
         let source = match parse_capslock_combo_name(&key) {
             Ok(source) => source,
             Err(error) => {
-                logging::log_line(format!(
-                    "skipping [Keys] mapping at line {line_number}: {error}"
-                ));
+                warn_invalid_mapping(
+                    validation,
+                    line_number,
+                    "keys",
+                    &key,
+                    &value,
+                    format!("invalid [Keys] mapping {key}: {error}"),
+                );
                 continue;
             }
         };
@@ -554,25 +922,35 @@ fn parse_capslock_plus_keys_section(content: &str) -> Result<Option<KeysSectionC
             Ok(Some(action)) => action,
             Ok(None) => continue,
             Err(error) => {
-                logging::log_line(format!(
-                    "skipping [Keys] mapping {} at line {line_number}: {error}",
-                    source.capslock_ini_key()
-                ));
+                warn_unknown_action(
+                    validation,
+                    line_number,
+                    "keys",
+                    &key,
+                    &value,
+                    format!("unknown action for [Keys] mapping {key}: {error}"),
+                );
                 continue;
             }
         };
 
-        push_mapping(&mut mappings, &mut seen_sources, source, action);
+        push_mapping(
+            &mut mappings,
+            &mut seen_sources,
+            source,
+            action,
+            validation,
+            line_number,
+            "keys",
+            &key,
+            &value,
+        );
     }
 
-    if found_keys_section {
-        Ok(Some(KeysSectionConfig {
-            mappings,
-            tap_capslock,
-        }))
-    } else {
-        Ok(None)
-    }
+    found_keys_section.then_some(KeysSectionConfig {
+        mappings,
+        tap_capslock,
+    })
 }
 
 fn push_mapping(
@@ -580,18 +958,84 @@ fn push_mapping(
     seen_sources: &mut BTreeSet<String>,
     source: KeyCombo,
     action: LayerAction,
+    validation: &mut ConfigValidation,
+    line_number: usize,
+    section: &str,
+    key: &str,
+    value: &str,
 ) {
     let normalized_source = source.ini_suffix();
     if !seen_sources.insert(normalized_source.clone()) {
-        logging::log_line(format!(
-            "skipping duplicate mapping for caps_{normalized_source}"
-        ));
+        warn_duplicate_mapping(
+            validation,
+            line_number,
+            section,
+            key,
+            value,
+            format!("duplicate mapping for caps_{normalized_source}"),
+        );
         return;
     }
 
     mappings.push(KeyMapping { source, action });
 }
 
+fn warn_invalid_mapping(
+    validation: &mut ConfigValidation,
+    line_number: usize,
+    section: &str,
+    key: &str,
+    value: &str,
+    message: String,
+) {
+    logging::log_line(format!("skipping mapping at line {line_number}: {message}"));
+    validation.warning(
+        ConfigIssueKind::InvalidMapping,
+        Some(line_number),
+        Some(section),
+        Some(key),
+        Some(value),
+        message,
+    );
+}
+
+fn warn_duplicate_mapping(
+    validation: &mut ConfigValidation,
+    line_number: usize,
+    section: &str,
+    key: &str,
+    value: &str,
+    message: String,
+) {
+    logging::log_line(format!("skipping mapping at line {line_number}: {message}"));
+    validation.warning(
+        ConfigIssueKind::DuplicateMapping,
+        Some(line_number),
+        Some(section),
+        Some(key),
+        Some(value),
+        message,
+    );
+}
+
+fn warn_unknown_action(
+    validation: &mut ConfigValidation,
+    line_number: usize,
+    section: &str,
+    key: &str,
+    value: &str,
+    message: String,
+) {
+    logging::log_line(format!("skipping mapping at line {line_number}: {message}"));
+    validation.warning(
+        ConfigIssueKind::UnknownAction,
+        Some(line_number),
+        Some(section),
+        Some(key),
+        Some(value),
+        message,
+    );
+}
 fn strip_inline_comment(value: &str) -> &str {
     for marker in [" ;", " #"] {
         if let Some(index) = value.find(marker) {
@@ -603,19 +1047,35 @@ fn strip_inline_comment(value: &str) -> &str {
 }
 
 fn read_bool(
-    section: &BTreeMap<String, String>,
+    section: &IniSection,
+    section_name: &str,
     key: &str,
     default_value: bool,
-) -> Result<bool, String> {
-    let Some(value) = section.get(key) else {
-        return Ok(default_value);
+    validation: &mut ConfigValidation,
+) -> bool {
+    let Some(value) = section.values.get(key) else {
+        return default_value;
     };
 
-    parse_bool(value).ok_or_else(|| format!("invalid bool for {key}: {value}"))
+    match parse_bool(&value.value) {
+        Some(parsed) => parsed,
+        None => {
+            validation.error(
+                ConfigIssueKind::InvalidValue,
+                Some(value.line_number),
+                Some(section_name),
+                Some(key),
+                Some(&value.value),
+                format!("invalid bool for {key}: {}", value.value),
+            );
+            default_value
+        }
+    }
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
-    match value {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
         "true" | "yes" | "on" | "1" => Some(true),
         "false" | "no" | "off" | "0" => Some(false),
         _ => None,
@@ -631,7 +1091,8 @@ fn bool_text(value: bool) -> &'static str {
 }
 
 fn parse_tap_capslock(value: &str) -> Result<TapCapsLock, String> {
-    match value {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
         "toggle" => Ok(TapCapsLock::Toggle),
         "escape" => Ok(TapCapsLock::Escape),
         "none" | "off" | "disabled" => Ok(TapCapsLock::None),
@@ -650,24 +1111,24 @@ fn parse_key_func_tap_capslock(value: &str) -> Result<TapCapsLock, String> {
 }
 
 fn parse_layer_action(value: &str) -> Result<Option<LayerAction>, String> {
-    let normalized = value.trim().to_ascii_lowercase();
-    if is_do_nothing_action(&normalized) {
+    let value = value.trim();
+    if is_do_nothing_action(value) {
         return Ok(None);
     }
 
-    if let Some(key_name) = normalized.strip_prefix("keytarget_") {
+    if let Some(key_name) = strip_ascii_case_prefix(value, "keytarget_") {
         let key = parse_key_code(key_name)
             .ok_or_else(|| format!("unsupported target key action: {value}"))?;
         return Ok(Some(LayerAction::KeyTap(key)));
     }
 
-    if let Some(combo_name) = normalized.strip_prefix("keycombo_") {
+    if let Some(combo_name) = strip_ascii_case_prefix(value, "keycombo_") {
         let combo = parse_combo_suffix(combo_name)
             .map_err(|error| format!("unsupported target combo action {value}: {error}"))?;
         return Ok(Some(LayerAction::KeyCombo(combo)));
     }
 
-    parse_builtin_action(&normalized).map(|action| Some(LayerAction::BuiltIn(action)))
+    parse_builtin_action(value).map(|action| Some(LayerAction::BuiltIn(action)))
 }
 
 fn parse_builtin_action(value: &str) -> Result<BuiltInAction, String> {
@@ -702,8 +1163,8 @@ fn parse_builtin_action(value: &str) -> Result<BuiltInAction, String> {
 }
 
 fn parse_key_func_call(value: &str) -> Result<(String, Option<u32>), String> {
-    let value = value.trim().to_ascii_lowercase();
-    let value = value.strip_prefix("keyfunc_").unwrap_or(&value);
+    let value = value.trim();
+    let value = strip_ascii_case_prefix(value, "keyfunc_").unwrap_or(value);
 
     let Some(open_index) = value.find('(') else {
         return Ok((value.to_string(), None));
@@ -733,19 +1194,79 @@ fn compact_name(value: &str) -> String {
 }
 
 fn is_do_nothing_action(value: &str) -> bool {
-    let normalized = value.trim().to_ascii_lowercase();
+    let value = value.trim();
+    let value = strip_ascii_case_prefix(value, "keyfunc_").unwrap_or(value);
     matches!(
-        normalized.strip_prefix("keyfunc_").unwrap_or(&normalized),
+        compact_name(value).as_str(),
         "donothing" | "none" | "off" | "disabled"
     )
 }
 
+fn strip_ascii_case_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    if value.len() < prefix.len() {
+        return None;
+    }
+
+    let (candidate, rest) = value.split_at(prefix.len());
+    candidate.eq_ignore_ascii_case(prefix).then_some(rest)
+}
 fn key_func_with_count(name: &str, count: u32) -> String {
     if count <= 1 {
         format!("keyFunc_{name}")
     } else {
         format!("keyFunc_{name}({count})")
     }
+}
+
+fn config_parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn temp_save_path(path: &Path) -> PathBuf {
+    let parent = config_parent_dir(path);
+    let file_name = path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("capslock_rs.ini"));
+    let counter = SAVE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let mut temp_name = OsString::from(".");
+    temp_name.push(file_name);
+    temp_name.push(format!(".tmp.{}.{}", std::process::id(), counter));
+    parent.join(temp_name)
+}
+
+fn write_temp_config(path: &Path, content: &str) -> Result<(), String> {
+    let mut file = File::create(path)
+        .map_err(|error| format!("failed to create temp config {}: {error}", path.display()))?;
+    file.write_all(content.as_bytes())
+        .map_err(|error| format!("failed to write temp config {}: {error}", path.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("failed to flush temp config {}: {error}", path.display()))?;
+    Ok(())
+}
+
+fn replace_file(source: &Path, target: &Path) -> Result<(), String> {
+    let source_wide = path_to_wide_null(source);
+    let target_wide = path_to_wide_null(target);
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    let replaced = unsafe { MoveFileExW(source_wide.as_ptr(), target_wide.as_ptr(), flags) };
+
+    if replaced == 0 {
+        return Err(format!(
+            "failed to replace {} with {}: {}",
+            target.display(),
+            source.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok(())
+}
+
+fn path_to_wide_null(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
 fn current_exe_dir() -> Result<PathBuf, String> {
@@ -758,6 +1279,8 @@ fn current_exe_dir() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use crate::keys::{KeyModifier, VK_F1, VK_HOME, VK_NEXT};
 
     #[test]
@@ -1063,6 +1586,144 @@ mod tests {
             find_action(&config, "lalt_shift_j"),
             Some(LayerAction::BuiltIn(BuiltInAction::SelectDown(5)))
         );
+    }
+    #[test]
+    fn reports_mapping_validation_warnings() {
+        let result = Config::from_ini_with_validation(
+            r#"
+            [Keys]
+            caps_h=keyFunc_moveLeft
+            caps_h=keyFunc_moveRight
+            caps_badkey=keyFunc_moveRight
+            caps_j=keyFunc_noSuchAction
+            caps_shift_lalt_k=keyFunc_moveUp
+            caps_lalt_shift_k=keyFunc_moveDown
+            "#,
+        );
+
+        assert!(!result.validation.has_errors());
+        assert!(has_issue(
+            &result.validation,
+            ConfigIssueKind::DuplicateMapping
+        ));
+        assert!(has_issue(
+            &result.validation,
+            ConfigIssueKind::InvalidMapping
+        ));
+        assert!(has_issue(
+            &result.validation,
+            ConfigIssueKind::UnknownAction
+        ));
+        assert_eq!(
+            find_action(&result.config, "h"),
+            Some(LayerAction::BuiltIn(BuiltInAction::MoveLeft(1)))
+        );
+        assert_eq!(
+            find_action(&result.config, "lalt_shift_k"),
+            Some(LayerAction::BuiltIn(BuiltInAction::MoveUp(1)))
+        );
+    }
+
+    #[test]
+    fn preserves_case_for_unparsed_string_values() {
+        let config = Config::from_ini(
+            r#"
+            [general]
+            enabled = ON
+            tap_capslock = EsCaPe
+
+            [Keys]
+            caps_r=KEYTARGET_F5
+            caps_lalt_d=KeyFunc_MoveWordRight(2)
+
+            [ui]
+            language = ZH_cn
+            settings_backend = IniBackendWithCASE
+            settings_page = C:\Users\TuIp\ConfigHTTP?Token=AbC123
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.general.enabled);
+        assert_eq!(config.general.tap_capslock, TapCapsLock::Escape);
+        assert_eq!(config.ui.language, Language::ZhCn);
+        assert_eq!(config.ui.settings_backend, "IniBackendWithCASE");
+        assert_eq!(
+            config.ui.settings_page,
+            "C:\\Users\\TuIp\\ConfigHTTP?Token=AbC123"
+        );
+        assert_eq!(
+            find_action(&config, "r"),
+            Some(LayerAction::KeyTap(parse_key_code("f5").unwrap()))
+        );
+        assert_eq!(
+            find_action(&config, "lalt_d"),
+            Some(LayerAction::BuiltIn(BuiltInAction::MoveWordRight(2)))
+        );
+    }
+
+    #[test]
+    fn reports_invalid_scalar_values_as_errors() {
+        let result = Config::from_ini_with_validation(
+            r#"
+            [general]
+            enabled = maybe
+
+            [ui]
+            language = fr-FR
+            "#,
+        );
+
+        assert!(result.validation.has_errors());
+        assert_eq!(
+            result
+                .validation
+                .errors()
+                .filter(|issue| issue.kind == ConfigIssueKind::InvalidValue)
+                .count(),
+            2
+        );
+        assert!(Config::from_ini("[general]\nenabled = maybe\n").is_err());
+    }
+
+    #[test]
+    fn save_keeps_existing_config_when_atomic_replace_fails() {
+        let dir = unique_temp_dir("atomic_save_failure");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("capslock_rs.ini");
+        let original = "[ui]\nsettings_page = KeepCASE\n";
+        fs::write(&path, original).unwrap();
+
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        let save_result = Config::default().save(&path);
+        let current = fs::read_to_string(&path).unwrap();
+
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&path, permissions).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(save_result.is_err());
+        assert_eq!(current, original);
+    }
+
+    fn has_issue(validation: &ConfigValidation, kind: ConfigIssueKind) -> bool {
+        validation.issues.iter().any(|issue| issue.kind == kind)
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "capslock_rs_{name}_{}_{}",
+            std::process::id(),
+            nanos
+        ))
     }
     fn find_action(config: &Config, source: &str) -> Option<LayerAction> {
         let source = parse_combo_suffix(source).unwrap();
