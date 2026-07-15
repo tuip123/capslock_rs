@@ -93,13 +93,22 @@ fn system_language() -> ResolvedLanguage {
 }
 
 fn text_for_resolved_language(language: ResolvedLanguage, key: &str) -> &'static str {
-    if let Some(value) = lookup(table_for_language(language), key) {
+    text_from_tables(language, table_for_language(language), EN_US, key)
+}
+
+fn text_from_tables(
+    language: ResolvedLanguage,
+    primary_table: &'static [(&'static str, &'static str)],
+    english_table: &'static [(&'static str, &'static str)],
+    key: &str,
+) -> &'static str {
+    if let Some(value) = lookup(primary_table, key) {
         return value;
     }
 
     if language != ResolvedLanguage::EnUs {
         log_missing(language, key, "falling back to en-US");
-        if let Some(value) = lookup(EN_US, key) {
+        if let Some(value) = lookup(english_table, key) {
             return value;
         }
     }
@@ -123,6 +132,11 @@ fn lookup(table: &'static [(&'static str, &'static str)], key: &str) -> Option<&
     table
         .iter()
         .find_map(|(entry_key, value)| (*entry_key == key).then_some(*value))
+}
+
+#[cfg(test)]
+fn key_set(table: &'static [(&'static str, &'static str)]) -> BTreeSet<&'static str> {
+    table.iter().map(|(key, _)| *key).collect()
 }
 
 fn log_missing(language: ResolvedLanguage, key: &str, fallback: &str) {
@@ -168,10 +182,66 @@ mod tests {
     }
 
     #[test]
-    fn missing_key_uses_stable_english_fallback() {
+    fn zh_cn_and_en_us_have_matching_translation_keys() {
+        let en_us_keys = key_set(EN_US);
+        let zh_cn_keys = key_set(ZH_CN);
+
+        assert_eq!(en_us_keys, zh_cn_keys);
+        assert_eq!(en_us_keys.len(), EN_US.len(), "en-US has duplicate keys");
+        assert_eq!(zh_cn_keys.len(), ZH_CN.len(), "zh-CN has duplicate keys");
+    }
+
+    #[test]
+    fn missing_localized_key_falls_back_to_en_us_when_available() {
+        static PARTIAL_ZH_CN: &[(&str, &str)] = &[("shared.key", "中文")];
+        static COMPLETE_EN_US: &[(&str, &str)] = &[
+            ("shared.key", "English"),
+            ("fallback.only", "English fallback"),
+        ];
+
         assert_eq!(
-            text_for_resolved_language(ResolvedLanguage::ZhCn, "missing.test.key"),
+            text_from_tables(
+                ResolvedLanguage::ZhCn,
+                PARTIAL_ZH_CN,
+                COMPLETE_EN_US,
+                "fallback.only"
+            ),
+            "English fallback"
+        );
+    }
+
+    #[test]
+    fn missing_key_uses_stable_fallback_and_records_once() {
+        let key = "missing.test.logged_key";
+
+        assert_eq!(
+            text_for_resolved_language(ResolvedLanguage::ZhCn, key),
             MISSING_TRANSLATION_FALLBACK
         );
+        assert_eq!(
+            text_for_resolved_language(ResolvedLanguage::ZhCn, key),
+            MISSING_TRANSLATION_FALLBACK
+        );
+
+        let lines = logging::captured_lines_for_test();
+        let zh_cn_logs = lines
+            .iter()
+            .filter(|line| {
+                line.contains("language=zh-CN")
+                    && line.contains(&format!("key={key}"))
+                    && line.contains("fallback=falling back to en-US")
+            })
+            .count();
+        let en_us_logs = lines
+            .iter()
+            .filter(|line| {
+                line.contains("language=en-US")
+                    && line.contains(&format!("key={key}"))
+                    && line.contains("fallback=using missing translation fallback")
+            })
+            .count();
+
+        assert_eq!(zh_cn_logs, 1);
+        assert_eq!(en_us_logs, 1);
     }
 }
