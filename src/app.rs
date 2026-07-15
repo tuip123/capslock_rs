@@ -3,22 +3,32 @@ use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 
+use windows_sys::Win32::Foundation::HWND;
+
 use crate::actions;
 use crate::config::{Config, ConfigPaths, Language};
+use crate::gui_settings::SettingsModel;
 use crate::hook::{HookState, KeyboardHook};
-use crate::{i18n, logging, startup, tray, win};
+use crate::{gui_settings, i18n, logging, startup, tray, win};
 
 pub static APP_CONTEXT: OnceLock<AppContext> = OnceLock::new();
 
 pub struct AppContext {
     pub config_path: PathBuf,
     pub log_path: PathBuf,
+    pub message_hwnd: Mutex<isize>,
     pub runtime: Mutex<RuntimeState>,
     pub hook_state: Mutex<HookState>,
 }
 
 pub struct RuntimeState {
     pub config: Config,
+}
+
+pub struct SettingsSnapshot {
+    pub model: SettingsModel,
+    pub config_path: PathBuf,
+    pub log_path: PathBuf,
 }
 
 pub fn run() -> Result<(), String> {
@@ -43,10 +53,12 @@ pub fn run() -> Result<(), String> {
         .spawn(move || actions::run_action_worker(action_receiver))
         .map_err(|error| format!("failed to start action worker: {error}"))?;
 
+    let show_tray_icon = config.general.show_tray_icon;
     APP_CONTEXT
         .set(AppContext {
             config_path: paths.config_path.clone(),
             log_path: paths.log_path.clone(),
+            message_hwnd: Mutex::new(0),
             hook_state: Mutex::new(HookState::from_config(&config, action_sender.clone())),
             runtime: Mutex::new(RuntimeState { config }),
         })
@@ -54,11 +66,8 @@ pub fn run() -> Result<(), String> {
 
     let _hook = KeyboardHook::install()?;
     let hwnd = tray::create_message_window()?;
-    let _tray_icon = if current_config()?.general.show_tray_icon {
-        Some(tray::TrayIcon::install(hwnd)?)
-    } else {
-        None
-    };
+    set_message_hwnd(hwnd)?;
+    tray::sync_icon(hwnd, show_tray_icon)?;
 
     logging::log_line(format!(
         "ready config={} log={}",
@@ -67,6 +76,7 @@ pub fn run() -> Result<(), String> {
     ));
 
     win::message_loop();
+    tray::remove_icon();
     logging::log_line("exiting CapsLock RS");
     Ok(())
 }
@@ -80,6 +90,36 @@ pub fn current_config() -> Result<Config, String> {
         .lock()
         .map_err(|_| "runtime state lock is poisoned".to_string())?;
     Ok(runtime.config.clone())
+}
+
+pub fn settings_snapshot() -> Result<SettingsSnapshot, String> {
+    let context = APP_CONTEXT
+        .get()
+        .ok_or_else(|| "app context is not initialized".to_string())?;
+    let runtime = context
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state lock is poisoned".to_string())?;
+
+    Ok(SettingsSnapshot {
+        model: SettingsModel::from_config(&runtime.config),
+        config_path: context.config_path.clone(),
+        log_path: context.log_path.clone(),
+    })
+}
+
+pub fn save_settings_model(model: &SettingsModel) -> Result<(), String> {
+    let context = APP_CONTEXT
+        .get()
+        .ok_or_else(|| "app context is not initialized".to_string())?;
+    let mut config = current_config()?;
+    model.apply_to_config(&mut config);
+
+    // Round-trip through the parser before writing so the GUI keeps Config as the rule source.
+    Config::from_ini(&config.to_ini_string())?;
+    config.save(&context.config_path)?;
+    reload_config();
+    Ok(())
 }
 
 pub fn is_enabled() -> bool {
@@ -102,6 +142,16 @@ pub fn current_language() -> Language {
     current_config()
         .map(|config| config.ui.language)
         .unwrap_or(Language::System)
+}
+
+pub fn message_hwnd() -> Option<HWND> {
+    let context = APP_CONTEXT.get()?;
+    let hwnd = context.message_hwnd.lock().ok()?;
+    if *hwnd == 0 {
+        None
+    } else {
+        Some(*hwnd as HWND)
+    }
 }
 
 pub fn toggle_enabled() {
@@ -141,6 +191,14 @@ pub fn reload_config() {
 
             if let Err(error) = startup::apply_startup(config.general.start_with_windows) {
                 logging::log_line(format!("failed to apply startup setting: {error}"));
+                show_error_message(language, "error.update_startup_failed", &error);
+            }
+
+            if let Some(hwnd) = message_hwnd() {
+                if let Err(error) = tray::sync_icon(hwnd, config.general.show_tray_icon) {
+                    logging::log_line(format!("failed to apply tray icon setting: {error}"));
+                    show_error_message(language, "error.update_tray_icon_failed", &error);
+                }
             }
 
             if let Ok(mut hook_state) = context.hook_state.lock() {
@@ -213,4 +271,23 @@ pub fn open_log() {
         return;
     };
     win::open_path(&context.log_path);
+}
+
+pub fn open_settings() {
+    if let Err(error) = gui_settings::open() {
+        logging::log_line(format!("failed to open settings window: {error}"));
+        show_error_message(current_language(), "error.open_settings_failed", &error);
+    }
+}
+
+fn set_message_hwnd(hwnd: HWND) -> Result<(), String> {
+    let context = APP_CONTEXT
+        .get()
+        .ok_or_else(|| "app context is not initialized".to_string())?;
+    let mut stored = context
+        .message_hwnd
+        .lock()
+        .map_err(|_| "message window lock is poisoned".to_string())?;
+    *stored = hwnd as isize;
+    Ok(())
 }

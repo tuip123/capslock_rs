@@ -1,5 +1,6 @@
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
+use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::UI::Shell::{
@@ -8,9 +9,8 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
     GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    TrackPopupMenu, TranslateMessage, HMENU, IDI_APPLICATION, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MSG, TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP,
-    WNDCLASSW,
+    TrackPopupMenu, TranslateMessage, HMENU, IDI_APPLICATION, MF_CHECKED, MF_SEPARATOR, MF_STRING,
+    MSG, TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
 };
 
 use crate::{app, i18n, logging, win};
@@ -27,8 +27,10 @@ const MENU_SETTINGS: usize = 1006;
 const MENU_EXIT: usize = 1007;
 
 pub struct TrayIcon {
-    hwnd: HWND,
+    hwnd: isize,
 }
+
+static TRAY_ICON: OnceLock<Mutex<Option<TrayIcon>>> = OnceLock::new();
 
 pub fn create_message_window() -> Result<HWND, String> {
     let class_name = win::to_wide_null(CLASS_NAME);
@@ -88,7 +90,9 @@ impl TrayIcon {
         }
 
         logging::log_line("tray icon installed");
-        Ok(Self { hwnd })
+        Ok(Self {
+            hwnd: hwnd as isize,
+        })
     }
 }
 
@@ -96,13 +100,38 @@ impl Drop for TrayIcon {
     fn drop(&mut self) {
         let mut nid: NOTIFYICONDATAW = unsafe { zeroed() };
         nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
-        nid.hWnd = self.hwnd;
+        nid.hWnd = self.hwnd as HWND;
         nid.uID = 1;
 
         unsafe {
             Shell_NotifyIconW(NIM_DELETE, &mut nid);
         }
         logging::log_line("tray icon removed");
+    }
+}
+
+pub fn sync_icon(hwnd: HWND, visible: bool) -> Result<(), String> {
+    let holder = TRAY_ICON.get_or_init(|| Mutex::new(None));
+    let mut icon = holder
+        .lock()
+        .map_err(|_| "tray icon lock is poisoned".to_string())?;
+
+    if visible {
+        if icon.is_none() {
+            *icon = Some(TrayIcon::install(hwnd)?);
+        }
+    } else if icon.is_some() {
+        *icon = None;
+    }
+
+    Ok(())
+}
+
+pub fn remove_icon() {
+    if let Some(holder) = TRAY_ICON.get() {
+        if let Ok(mut icon) = holder.lock() {
+            *icon = None;
+        }
     }
 }
 
@@ -185,9 +214,9 @@ fn show_menu(hwnd: HWND) {
     );
     append_menu(
         menu,
-        MF_STRING | MF_GRAYED,
+        MF_STRING,
         MENU_SETTINGS,
-        i18n::text(language, "tray.settings_future"),
+        i18n::text(language, "tray.settings"),
     );
     append_separator(menu);
     append_menu(
@@ -213,6 +242,7 @@ fn handle_menu_command(command: usize) {
         MENU_RELOAD_CONFIG => app::reload_config(),
         MENU_OPEN_CONFIG => app::open_config(),
         MENU_OPEN_LOG => app::open_log(),
+        MENU_SETTINGS => app::open_settings(),
         MENU_EXIT => unsafe { PostQuitMessage(0) },
         _ => {}
     }
