@@ -28,6 +28,14 @@ pub struct GeneralConfig {
 pub struct UiConfig {
     pub settings_backend: String,
     pub settings_page: String,
+    pub language: Language,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Language {
+    System,
+    ZhCn,
+    EnUs,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,6 +162,7 @@ impl Default for Config {
             ui: UiConfig {
                 settings_backend: "ini".to_string(),
                 settings_page: "future".to_string(),
+                language: Language::System,
             },
         }
     }
@@ -228,6 +237,9 @@ impl Config {
             if let Some(value) = ui.get("settings_page") {
                 config.ui.settings_page = value.clone();
             }
+            if let Some(value) = ui.get("language") {
+                config.ui.language = Language::parse(value)?;
+            }
         }
 
         Ok(config)
@@ -266,6 +278,10 @@ impl Config {
         }
 
         output.push_str("\n[ui]\n");
+        output.push_str(&format!(
+            "language = {}\n",
+            self.ui.language.as_config_value()
+        ));
         output.push_str(&format!(
             "settings_backend = {}\n",
             self.ui.settings_backend
@@ -315,6 +331,32 @@ impl LayerAction {
             LayerAction::BuiltIn(action) => action.as_key_func(),
             LayerAction::KeyTap(key) => format!("keyTarget_{}", key.name),
             LayerAction::KeyCombo(combo) => format!("keyCombo_{}", combo.ini_suffix()),
+        }
+    }
+}
+
+impl Default for Language {
+    fn default() -> Self {
+        Self::System
+    }
+}
+
+impl Language {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+        match normalized.as_str() {
+            "system" => Ok(Self::System),
+            "zh-cn" => Ok(Self::ZhCn),
+            "en-us" => Ok(Self::EnUs),
+            _ => Err(format!("invalid language value: {value}")),
+        }
+    }
+
+    pub fn as_config_value(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::ZhCn => "zh-CN",
+            Self::EnUs => "en-US",
         }
     }
 }
@@ -848,6 +890,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_ui_language_values() {
+        let zh_cn = Config::from_ini(
+            r#"
+            [ui]
+            language = zh-CN
+            "#,
+        )
+        .unwrap();
+        let en_us = Config::from_ini(
+            r#"
+            [ui]
+            language = en_us
+            "#,
+        )
+        .unwrap();
+        let system = Config::from_ini(
+            r#"
+            [ui]
+            language = system
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(zh_cn.ui.language, Language::ZhCn);
+        assert_eq!(en_us.ui.language, Language::EnUs);
+        assert_eq!(system.ui.language, Language::System);
+        assert!(Config::from_ini("[ui]\nlanguage = fr-FR\n").is_err());
+    }
+
+    #[test]
+    fn serializes_ui_language_values() {
+        let default_ini = Config::default().to_ini_string();
+        assert!(default_ini.contains("language = system"));
+
+        let mut config = Config::default();
+        config.ui.language = Language::ZhCn;
+        assert!(config.to_ini_string().contains("language = zh-CN"));
+
+        config.ui.language = Language::EnUs;
+        assert!(config.to_ini_string().contains("language = en-US"));
+    }
     #[test]
     fn serializes_normalized_modifiers_and_action_types() {
         let config = Config {

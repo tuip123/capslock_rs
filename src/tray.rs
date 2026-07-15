@@ -13,7 +13,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WNDCLASSW,
 };
 
-use crate::{app, logging, win};
+use crate::{app, i18n, logging, win};
 
 const CLASS_NAME: &str = "CapsLockRSMessageWindow";
 const WM_TRAYICON: u32 = WM_APP + 1;
@@ -150,25 +150,52 @@ fn show_menu(hwnd: HWND) {
         MF_STRING
     };
 
-    append_menu(menu, enabled_flags, MENU_TOGGLE_ENABLED, "Enabled");
+    let language = app::current_language();
+
+    append_menu(
+        menu,
+        enabled_flags,
+        MENU_TOGGLE_ENABLED,
+        i18n::text(language, "tray.enabled"),
+    );
     append_menu(
         menu,
         startup_flags,
         MENU_TOGGLE_STARTUP,
-        "Start with Windows",
+        i18n::text(language, "tray.start_with_windows"),
     );
     append_separator(menu);
-    append_menu(menu, MF_STRING, MENU_RELOAD_CONFIG, "Reload config");
-    append_menu(menu, MF_STRING, MENU_OPEN_CONFIG, "Open config");
-    append_menu(menu, MF_STRING, MENU_OPEN_LOG, "Open log");
+    append_menu(
+        menu,
+        MF_STRING,
+        MENU_RELOAD_CONFIG,
+        i18n::text(language, "tray.reload_config"),
+    );
+    append_menu(
+        menu,
+        MF_STRING,
+        MENU_OPEN_CONFIG,
+        i18n::text(language, "tray.open_config"),
+    );
+    append_menu(
+        menu,
+        MF_STRING,
+        MENU_OPEN_LOG,
+        i18n::text(language, "tray.open_log"),
+    );
     append_menu(
         menu,
         MF_STRING | MF_GRAYED,
         MENU_SETTINGS,
-        "Settings page (future)",
+        i18n::text(language, "tray.settings_future"),
     );
     append_separator(menu);
-    append_menu(menu, MF_STRING, MENU_EXIT, "Exit");
+    append_menu(
+        menu,
+        MF_STRING,
+        MENU_EXIT,
+        i18n::text(language, "tray.exit"),
+    );
 
     let mut point = POINT { x: 0, y: 0 };
     unsafe {

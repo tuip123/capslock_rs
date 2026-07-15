@@ -16,6 +16,7 @@ CapsLock RS 是一个 Windows 平台的轻量键盘增强工具。它将 `CapsLo
 - 支持带次数参数的动作，例如 `keyFunc_moveUp(5)` 和 `keyFunc_selectUp(5)`。
 - 支持按词移动、选择、Home/End/PageUp/PageDown 和按词删除。
 - 支持单实例、后台运行、系统托盘、配置重载和打开日志。
+- 支持 `system`、`zh-CN` 和 `en-US` 界面语言，托盘菜单和错误摘要已本地化。
 - 支持当前用户开机启动。
 - 可选以管理员身份运行，用于向管理员权限窗口发送按键。
 - 支持 UTF-8、UTF-16 LE BOM 和 UTF-16 BE BOM 配置文件。
@@ -94,6 +95,7 @@ caps_lalt_d=keyFunc_moveWordRight
 ; caps_u=keyFunc_selectUp(5)
 
 [ui]
+language = system
 settings_backend = ini
 settings_page = future
 ```
@@ -104,6 +106,8 @@ settings_page = future
 2. 当前工作目录下的 `capslock_rs.ini`。
 3. 程序同目录下的 `capslock_rs.ini`。
 4. 开发环境中的项目根目录。
+
+`[ui]` 中的 `language` 支持 `system`、`zh-CN` 和 `en-US`。`system` 会跟随 Windows 界面语言，中文系统使用简体中文，其他语言回退为英文。
 
 `[Keys]` 的源组合键统一写成 `caps_<修饰键>_<按键>`。修饰键支持 `ctrl`、`lctrl`、`rctrl`、`alt`、`lalt`、`ralt`、`shift`、`lshift`、`rshift`、`win`、`lwin`、`rwin`，多个修饰键的顺序会自动标准化，例如 `caps_shift_lalt_j` 会保存为 `caps_lalt_shift_j`。
 
@@ -164,7 +168,7 @@ run_as_admin = true
 
 后续开发将转向界面与发布准备：
 
-- 建立中文和英文界面资源，默认支持简体中文，并允许跟随系统或手动切换语言。
+- 在后续 GUI 配置页中继续复用中文和英文界面资源，支持跟随系统或手动切换语言。
 - 开发 GUI 配置页，用可视化方式新增、编辑、校验和删除键位映射。
 - 后期以受控方式支持启动程序和执行外部脚本。
 - 完成许可证、CI、发布包和兼容性验证。

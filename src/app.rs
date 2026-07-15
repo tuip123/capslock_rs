@@ -4,9 +4,9 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 use crate::actions;
-use crate::config::{Config, ConfigPaths};
+use crate::config::{Config, ConfigPaths, Language};
 use crate::hook::{HookState, KeyboardHook};
-use crate::{logging, startup, tray, win};
+use crate::{i18n, logging, startup, tray, win};
 
 pub static APP_CONTEXT: OnceLock<AppContext> = OnceLock::new();
 
@@ -98,6 +98,12 @@ pub fn start_with_windows() -> bool {
         .unwrap_or(false)
 }
 
+pub fn current_language() -> Language {
+    current_config()
+        .map(|config| config.ui.language)
+        .unwrap_or(Language::System)
+}
+
 pub fn toggle_enabled() {
     let Some(context) = APP_CONTEXT.get() else {
         return;
@@ -117,18 +123,17 @@ pub fn reload_config() {
         return;
     };
 
+    let fallback_language = current_language();
     match Config::load(&context.config_path) {
         Ok(config) => {
+            let language = config.ui.language;
             if config.general.run_as_admin && !win::is_user_admin() {
                 logging::log_line("run_as_admin=true after reload, relaunching with UAC elevation");
                 match win::relaunch_as_admin() {
                     Ok(()) => win::quit_message_loop(),
                     Err(error) => {
                         logging::log_line(format!("failed to relaunch as admin: {error}"));
-                        win::message_box(
-                            "CapsLock RS",
-                            &format!("Failed to relaunch as admin:\n{error}"),
-                        );
+                        show_error_message(language, "error.relaunch_as_admin_failed", &error);
                     }
                 }
                 return;
@@ -154,7 +159,7 @@ pub fn reload_config() {
         }
         Err(error) => {
             logging::log_line(format!("failed to reload config: {error}"));
-            win::message_box("CapsLock RS", &format!("Reload failed:\n{error}"));
+            show_error_message(fallback_language, "error.reload_failed", &error);
         }
     }
 }
@@ -170,18 +175,16 @@ pub fn toggle_startup() {
     };
 
     runtime.config.general.start_with_windows = !runtime.config.general.start_with_windows;
+    let language = runtime.config.ui.language;
     if let Err(error) = runtime.config.save(&context.config_path) {
         logging::log_line(format!("failed to save startup config: {error}"));
-        win::message_box("CapsLock RS", &format!("Failed to save config:\n{error}"));
+        show_error_message(language, "error.save_config_failed", &error);
         return;
     }
 
     if let Err(error) = startup::apply_startup(runtime.config.general.start_with_windows) {
         logging::log_line(format!("failed to apply startup setting: {error}"));
-        win::message_box(
-            "CapsLock RS",
-            &format!("Failed to update startup:\n{error}"),
-        );
+        show_error_message(language, "error.update_startup_failed", &error);
         return;
     }
 
@@ -189,6 +192,13 @@ pub fn toggle_startup() {
         "start_with_windows={}",
         runtime.config.general.start_with_windows
     ));
+}
+
+fn show_error_message(language: Language, summary_key: &str, detail: &str) {
+    win::message_box(
+        i18n::text(language, "app.title"),
+        &i18n::message_with_detail(language, summary_key, detail),
+    );
 }
 
 pub fn open_config() {
