@@ -96,7 +96,7 @@ struct SettingsWindowState {
 
 const CLASS_NAME: &str = "CapsLockRSSettingsWindow";
 const WINDOW_WIDTH: i32 = 880;
-const WINDOW_HEIGHT: i32 = 760;
+const WINDOW_HEIGHT: i32 = 800;
 
 const ID_ENABLED: i32 = 3001;
 const ID_START_WITH_WINDOWS: i32 = 3002;
@@ -141,6 +141,8 @@ const ID_BINDING_ACTION_COUNT_LABEL: i32 = 3040;
 const ID_BINDING_ACTION_COUNT: i32 = 3041;
 const ID_BINDING_SOURCE_CAPTURE: i32 = 3042;
 const ID_BINDING_ACTION_CAPTURE: i32 = 3043;
+const ID_BINDING_PREVIEW_LABEL: i32 = 3044;
+const ID_BINDING_PREVIEW: i32 = 3045;
 
 const BM_GETCHECK: u32 = 0x00F0;
 const BM_SETCHECK: u32 = 0x00F1;
@@ -157,6 +159,7 @@ const LB_SETCURSEL: u32 = 0x0186;
 const LB_ERR: isize = -1;
 const LBN_SELCHANGE: u16 = 1;
 const CBN_SELCHANGE: u16 = 1;
+const EN_CHANGE: u16 = 0x0300;
 const WS_VSCROLL: u32 = 0x00200000;
 const KEY_CAPTURE_TIMER_ID: usize = 1;
 const KEY_CAPTURE_TIMEOUT_MS: u32 = 10_000;
@@ -584,7 +587,163 @@ fn binding_rows_ini_from_entries(entries: &[BindingRowIniEntry]) -> String {
     }
     content
 }
+fn binding_editor_ini_preview_text(
+    language: Language,
+    rows: &[KeyBindingRow],
+    selected_index: Option<usize>,
+    edited_row: &KeyBindingRow,
+) -> String {
+    let (candidate_rows, preview_index) = preview_candidate_rows(rows, selected_index, edited_row);
+    let statuses = binding_row_statuses_for_rows(&candidate_rows);
+    let status = statuses
+        .get(preview_index)
+        .copied()
+        .unwrap_or(KeyBindingRowStatus::ConfigError);
+    if status != KeyBindingRowStatus::Normal {
+        let report = validate_binding_rows_for_save(&candidate_rows);
+        return binding_preview_error_summary(
+            language,
+            &report,
+            &candidate_rows,
+            preview_index,
+            status,
+        );
+    }
 
+    match binding_row_serialized_ini_expression(edited_row) {
+        Ok(expression) => expression,
+        Err(report) => binding_preview_error_summary(
+            language,
+            &report,
+            std::slice::from_ref(edited_row),
+            0,
+            KeyBindingRowStatus::ConfigError,
+        ),
+    }
+}
+
+fn preview_candidate_rows(
+    rows: &[KeyBindingRow],
+    selected_index: Option<usize>,
+    edited_row: &KeyBindingRow,
+) -> (Vec<KeyBindingRow>, usize) {
+    let mut candidate_rows = rows.to_vec();
+    match selected_index {
+        Some(index) if index < candidate_rows.len() => {
+            candidate_rows[index] = edited_row.clone();
+            (candidate_rows, index)
+        }
+        _ => {
+            candidate_rows.push(edited_row.clone());
+            let index = candidate_rows.len() - 1;
+            (candidate_rows, index)
+        }
+    }
+}
+
+fn binding_row_serialized_ini_expression(
+    row: &KeyBindingRow,
+) -> Result<String, SettingsValidationReport> {
+    let content = binding_rows_ini(std::slice::from_ref(row)).map_err(|error| {
+        settings_validation_report_from_error(ConfigIssueKind::Syntax, error, 1)
+    })?;
+    let parsed = Config::from_ini_with_validation(&content);
+    let report =
+        settings_validation_report(parsed.validation, 1, parsed.config.capslock_layer.len());
+    if report.has_errors() {
+        return Err(report);
+    }
+    // Serialize through Config so preview formatting stays aligned with real saves.
+
+    let mut config = Config::default();
+    config.capslock_layer = parsed.config.capslock_layer;
+    first_serialized_keys_expression(&config.to_ini_string()).ok_or_else(|| {
+        settings_validation_report_from_error(
+            ConfigIssueKind::InvalidMapping,
+            "failed to render preview binding row through Config serialization",
+            1,
+        )
+    })
+}
+
+fn first_serialized_keys_expression(content: &str) -> Option<String> {
+    let mut in_keys = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("[Keys]") {
+            in_keys = true;
+            continue;
+        }
+        if !in_keys {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            break;
+        }
+        if trimmed.is_empty() || trimmed.starts_with(';') {
+            continue;
+        }
+        if trimmed.contains('=') {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn binding_preview_error_summary(
+    language: Language,
+    report: &SettingsValidationReport,
+    rows: &[KeyBindingRow],
+    row_index: usize,
+    status: KeyBindingRowStatus,
+) -> String {
+    let prefix = i18n::text(language, "settings.binding.preview_error");
+    if let Some(issue) =
+        first_preview_issue(report, rows, row_index).or_else(|| report.validation.issues.first())
+    {
+        let detail = format_settings_validation_issue(language, issue);
+        return format!("{}{}", prefix, detail.trim_start_matches("- "));
+    }
+    format!("{}{}", prefix, i18n::text(language, status.i18n_key()))
+}
+
+fn first_preview_issue<'a>(
+    report: &'a SettingsValidationReport,
+    rows: &[KeyBindingRow],
+    row_index: usize,
+) -> Option<&'a ConfigIssue> {
+    let entries = binding_row_ini_entries(rows).ok()?;
+    report
+        .validation
+        .issues
+        .iter()
+        .find(|issue| issue_applies_to_preview_row(issue, rows, &entries, row_index))
+}
+
+fn issue_applies_to_preview_row(
+    issue: &ConfigIssue,
+    rows: &[KeyBindingRow],
+    entries: &[BindingRowIniEntry],
+    row_index: usize,
+) -> bool {
+    if row_index_for_issue(issue, entries) == Some(row_index) {
+        return true;
+    }
+
+    if issue.kind != ConfigIssueKind::DuplicateMapping {
+        return false;
+    }
+    let Some(issue_index) = row_index_for_issue(issue, entries) else {
+        return false;
+    };
+    let Some(issue_source) = rows.get(issue_index).and_then(normalized_row_source) else {
+        return false;
+    };
+    let Some(row_source) = rows.get(row_index).and_then(normalized_row_source) else {
+        return false;
+    };
+    row_source == issue_source
+}
 fn settings_validation_report_from_ini(
     content: &str,
     expected_mapping_count: usize,
@@ -1088,6 +1247,12 @@ fn handle_command(hwnd: HWND, command: i32, notification: u16) {
         ID_OPEN_LOG => app::open_log(),
         ID_BINDING_LIST if notification == LBN_SELCHANGE => change_selected_binding(hwnd),
         ID_BINDING_ACTION_KIND if notification == CBN_SELCHANGE => change_binding_action_kind(hwnd),
+        ID_BINDING_SOURCE | ID_BINDING_ACTION_VALUE if notification == CBN_SELCHANGE => {
+            refresh_binding_preview_after_edit(hwnd)
+        }
+        ID_BINDING_ACTION_COUNT if notification == EN_CHANGE => {
+            refresh_binding_preview_after_edit(hwnd)
+        }
         ID_BINDING_SOURCE_MODIFIER_ADD => add_modifier_to_editor(hwnd, &SOURCE_MODIFIER_IDS),
         ID_BINDING_ACTION_MODIFIER_ADD => add_modifier_to_editor(hwnd, &ACTION_MODIFIER_IDS),
         ID_BINDING_SOURCE_CAPTURE => toggle_key_capture(hwnd, KeyCaptureMode::Source),
@@ -1298,6 +1463,7 @@ fn change_binding_action_kind(hwnd: HWND) {
     let row = KeyBindingRow::new("caps_space", kind, default_action_value(kind));
     if let Err(error) = populate_binding_action_editor(hwnd, language, &row)
         .and_then(|()| update_capture_controls(hwnd))
+        .and_then(|()| refresh_binding_preview(hwnd))
     {
         handle_binding_error(hwnd, error);
     }
@@ -1380,6 +1546,7 @@ fn apply_captured_source(hwnd: HWND, combo: &KeyCombo) -> Result<(), String> {
     populate_modifier_combos(hwnd, &SOURCE_MODIFIER_IDS, &parts.modifiers)?;
     refresh_modifier_editor_visibility(hwnd, &SOURCE_MODIFIER_IDS)?;
     populate_combo_values(hwnd, ID_BINDING_SOURCE, KEY_CHOICES, &parts.key)?;
+    refresh_binding_preview(hwnd)?;
     set_status(hwnd, state_language(), "settings.capture_source_saved")
 }
 
@@ -1401,6 +1568,7 @@ fn apply_captured_target(hwnd: HWND, combo: &KeyCombo) -> Result<(), String> {
         populate_combo_values(hwnd, ID_BINDING_ACTION_VALUE, KEY_CHOICES, &parts.key)?;
     }
     update_capture_controls(hwnd)?;
+    refresh_binding_preview(hwnd)?;
     set_status(hwnd, language, "settings.capture_target_saved")
 }
 
@@ -1506,6 +1674,26 @@ fn collect_binding_editor_row(hwnd: HWND) -> Result<KeyBindingRow, String> {
     Ok(KeyBindingRow::new(source, action_kind, action_value))
 }
 
+fn refresh_binding_preview(hwnd: HWND) -> Result<(), String> {
+    let language = state_language();
+    let preview = match collect_binding_editor_row(hwnd) {
+        Ok(row) => {
+            let (rows, selected) =
+                with_state(|state| (state.model.binding_rows(), state.selected_binding_index))?;
+            binding_editor_ini_preview_text(language, &rows, selected, &row)
+        }
+        Err(error) => format!(
+            "{}{}",
+            i18n::text(language, "settings.binding.preview_error"),
+            error
+        ),
+    };
+    set_control_text(hwnd, ID_BINDING_PREVIEW, &preview)
+}
+
+fn refresh_binding_preview_after_edit(hwnd: HWND) {
+    let _ = refresh_binding_preview(hwnd);
+}
 fn handle_binding_error(hwnd: HWND, error: String) {
     let language = state_language();
     logging::log_line(format!("failed to update key binding list: {error}"));
@@ -1589,9 +1777,11 @@ fn create_controls(hwnd: HWND) -> Result<(), String> {
     create_button(hwnd, ID_BINDING_UPDATE, 604, 632, 88, 28)?;
     create_button(hwnd, ID_BINDING_DELETE, 708, 632, 88, 28)?;
 
-    create_static(hwnd, ID_STATUS, 18, 690, 500, 24)?;
-    create_button(hwnd, ID_SAVE, 632, 688, 88, 28)?;
-    create_button(hwnd, ID_CLOSE, 742, 688, 88, 28)?;
+    create_static(hwnd, ID_BINDING_PREVIEW_LABEL, 500, 666, 330, 22)?;
+    create_readonly_edit(hwnd, ID_BINDING_PREVIEW, 500, 690, 330, 24)?;
+    create_static(hwnd, ID_STATUS, 18, 730, 500, 24)?;
+    create_button(hwnd, ID_SAVE, 632, 728, 88, 28)?;
+    create_button(hwnd, ID_CLOSE, 742, 728, 88, 28)?;
     Ok(())
 }
 
@@ -1699,6 +1889,11 @@ fn refresh_window(hwnd: HWND, status_key: Option<&str>) -> Result<(), String> {
         ID_BINDING_DELETE,
         i18n::text(language, "settings.binding.delete"),
     )?;
+    set_control_text(
+        hwnd,
+        ID_BINDING_PREVIEW_LABEL,
+        i18n::text(language, "settings.binding.ini_preview"),
+    )?;
 
     set_checkbox(hwnd, ID_ENABLED, model.enabled)?;
     set_checkbox(hwnd, ID_START_WITH_WINDOWS, model.start_with_windows)?;
@@ -1789,7 +1984,7 @@ fn populate_binding_editor(hwnd: HWND) -> Result<(), String> {
     populate_binding_action_kind(hwnd, language, row.action_kind)?;
     populate_binding_action_editor(hwnd, language, &row)?;
     update_capture_controls(hwnd)?;
-    Ok(())
+    refresh_binding_preview(hwnd)
 }
 
 fn populate_binding_source_editor(hwnd: HWND, row: &KeyBindingRow) -> Result<(), String> {
@@ -1873,7 +2068,8 @@ fn add_modifier_to_editor(hwnd: HWND, ids: &[i32]) {
             modifiers.push(next_modifier_choice(&modifiers).to_string());
         }
         populate_modifier_combos(hwnd, ids, &modifiers)?;
-        refresh_modifier_editor_visibility(hwnd, ids)
+        refresh_modifier_editor_visibility(hwnd, ids)?;
+        refresh_binding_preview(hwnd)
     })();
 
     if let Err(error) = result {
@@ -1890,7 +2086,8 @@ fn normalize_modifier_editor(hwnd: HWND, changed_id: i32) {
     let result = (|| {
         let modifiers = selected_modifier_values(hwnd, ids)?;
         populate_modifier_combos(hwnd, ids, &modifiers)?;
-        refresh_modifier_editor_visibility(hwnd, ids)
+        refresh_modifier_editor_visibility(hwnd, ids)?;
+        refresh_binding_preview(hwnd)
     })();
 
     if let Err(error) = result {
@@ -2641,6 +2838,62 @@ mod tests {
         assert!(ini.contains("caps_r=keyTarget_f5"));
         assert!(ini.contains("caps_c=keyCombo_ctrl_c"));
         assert_eq!(reparsed_model.binding_rows(), rows);
+    }
+
+    #[test]
+    fn binding_ini_preview_covers_all_action_types() {
+        let cases = [
+            (
+                KeyBindingRow::new("caps_h", KeyBindingActionKind::BuiltIn, "moveLeft"),
+                "caps_h=keyFunc_moveLeft",
+            ),
+            (
+                KeyBindingRow::new("caps_r", KeyBindingActionKind::KeyTap, "f5"),
+                "caps_r=keyTarget_f5",
+            ),
+            (
+                KeyBindingRow::new("caps_c", KeyBindingActionKind::KeyCombo, "ctrl_c"),
+                "caps_c=keyCombo_ctrl_c",
+            ),
+        ];
+
+        for (row, expected) in cases {
+            assert_eq!(
+                binding_editor_ini_preview_text(Language::EnUs, &[], None, &row),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn binding_ini_preview_reports_localized_error_for_invalid_edit() {
+        let rows = vec![KeyBindingRow::new(
+            "caps_j",
+            KeyBindingActionKind::BuiltIn,
+            "moveLeft",
+        )];
+        let edited = KeyBindingRow::new("caps_j", KeyBindingActionKind::BuiltIn, "noSuchAction");
+
+        let preview = binding_editor_ini_preview_text(Language::ZhCn, &rows, Some(0), &edited);
+
+        assert!(preview.contains("预览错误"));
+        assert!(preview.contains("未知动作"));
+        assert!(preview.contains("caps_j=keyFunc_noSuchAction"));
+        assert!(!preview.contains("caps_j=keyFunc_moveLeft"));
+    }
+
+    #[test]
+    fn binding_ini_preview_reports_duplicate_current_row() {
+        let rows = vec![
+            KeyBindingRow::new("caps_h", KeyBindingActionKind::BuiltIn, "moveLeft"),
+            KeyBindingRow::new("caps_j", KeyBindingActionKind::BuiltIn, "moveDown"),
+        ];
+        let edited = KeyBindingRow::new("caps_h", KeyBindingActionKind::BuiltIn, "moveRight");
+
+        let preview = binding_editor_ini_preview_text(Language::EnUs, &rows, Some(1), &edited);
+
+        assert!(preview.contains("Preview error"));
+        assert!(preview.contains("Duplicate mapping"));
     }
 
     #[test]
