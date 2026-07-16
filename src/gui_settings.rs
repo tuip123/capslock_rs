@@ -9,14 +9,16 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT, HBRUSH};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetDlgItem, GetWindowTextLengthW,
-    GetWindowTextW, IsWindow, LoadCursorW, RegisterClassW, SendMessageW, SetForegroundWindow,
-    SetWindowTextW, ShowWindow, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING,
-    CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_READONLY, HMENU,
-    IDC_ARROW, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_BORDER,
-    WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    GetWindowTextW, IsWindow, LoadCursorW, MoveWindow, RegisterClassW, SendMessageW,
+    SetForegroundWindow, SetWindowTextW, ShowWindow, BS_AUTOCHECKBOX, BS_PUSHBUTTON,
+    CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, CW_USEDEFAULT,
+    ES_AUTOHSCROLL, ES_READONLY, HMENU, IDC_ARROW, SW_HIDE, SW_SHOW, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX,
+    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::config::{Config, ConfigIssue, KeyMapping, Language, LayerAction, TapCapsLock};
+use crate::keys::{parse_capslock_combo_name, parse_combo_suffix, KeyCombo};
 use crate::{app, i18n, logging, win};
 
 #[derive(Clone, Debug)]
@@ -44,6 +46,18 @@ pub struct KeyBindingRow {
     pub action_value: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ComboEditorParts {
+    modifiers: Vec<String>,
+    key: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BuiltInEditorValue {
+    name: String,
+    count: u32,
+}
+
 struct SettingsWindowState {
     hwnd: isize,
     model: SettingsModel,
@@ -53,8 +67,8 @@ struct SettingsWindowState {
 }
 
 const CLASS_NAME: &str = "CapsLockRSSettingsWindow";
-const WINDOW_WIDTH: i32 = 760;
-const WINDOW_HEIGHT: i32 = 700;
+const WINDOW_WIDTH: i32 = 880;
+const WINDOW_HEIGHT: i32 = 760;
 
 const ID_ENABLED: i32 = 3001;
 const ID_START_WITH_WINDOWS: i32 = 3002;
@@ -81,9 +95,21 @@ const ID_BINDING_ACTION_KIND_LABEL: i32 = 3022;
 const ID_BINDING_ACTION_KIND: i32 = 3023;
 const ID_BINDING_ACTION_VALUE_LABEL: i32 = 3024;
 const ID_BINDING_ACTION_VALUE: i32 = 3025;
-const ID_BINDING_ADD: i32 = 3026;
 const ID_BINDING_UPDATE: i32 = 3027;
 const ID_BINDING_DELETE: i32 = 3028;
+const ID_BINDING_SOURCE_PREFIX: i32 = 3029;
+const ID_BINDING_SOURCE_MODIFIER_1: i32 = 3030;
+const ID_BINDING_SOURCE_MODIFIER_2: i32 = 3031;
+const ID_BINDING_SOURCE_MODIFIER_3: i32 = 3032;
+const ID_BINDING_SOURCE_MODIFIER_4: i32 = 3033;
+const ID_BINDING_ACTION_MODIFIER_1: i32 = 3034;
+const ID_BINDING_ACTION_MODIFIER_2: i32 = 3035;
+const ID_BINDING_ACTION_MODIFIER_3: i32 = 3036;
+const ID_BINDING_ACTION_MODIFIER_4: i32 = 3037;
+const ID_BINDING_SOURCE_MODIFIER_ADD: i32 = 3038;
+const ID_BINDING_ACTION_MODIFIER_ADD: i32 = 3039;
+const ID_BINDING_ACTION_COUNT_LABEL: i32 = 3040;
+const ID_BINDING_ACTION_COUNT: i32 = 3041;
 
 const BM_GETCHECK: u32 = 0x00F0;
 const BM_SETCHECK: u32 = 0x00F1;
@@ -99,7 +125,142 @@ const LB_GETCURSEL: u32 = 0x0188;
 const LB_SETCURSEL: u32 = 0x0186;
 const LB_ERR: isize = -1;
 const LBN_SELCHANGE: u16 = 1;
+const CBN_SELCHANGE: u16 = 1;
 const WS_VSCROLL: u32 = 0x00200000;
+const NO_MODIFIER_CHOICE: &str = "-";
+const SOURCE_MODIFIER_IDS: [i32; 4] = [
+    ID_BINDING_SOURCE_MODIFIER_1,
+    ID_BINDING_SOURCE_MODIFIER_2,
+    ID_BINDING_SOURCE_MODIFIER_3,
+    ID_BINDING_SOURCE_MODIFIER_4,
+];
+const ACTION_MODIFIER_IDS: [i32; 4] = [
+    ID_BINDING_ACTION_MODIFIER_1,
+    ID_BINDING_ACTION_MODIFIER_2,
+    ID_BINDING_ACTION_MODIFIER_3,
+    ID_BINDING_ACTION_MODIFIER_4,
+];
+const MODIFIER_CHOICES: &[&str] = &[
+    NO_MODIFIER_CHOICE,
+    "ctrl",
+    "alt",
+    "shift",
+    "win",
+    "lctrl",
+    "rctrl",
+    "lalt",
+    "ralt",
+    "lshift",
+    "rshift",
+    "lwin",
+    "rwin",
+];
+const KEY_CHOICES: &[&str] = &[
+    "space",
+    "a",
+    "b",
+    "c",
+    "d",
+    "e",
+    "f",
+    "g",
+    "h",
+    "i",
+    "j",
+    "k",
+    "l",
+    "m",
+    "n",
+    "o",
+    "p",
+    "q",
+    "r",
+    "s",
+    "t",
+    "u",
+    "v",
+    "w",
+    "x",
+    "y",
+    "z",
+    "0",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "enter",
+    "escape",
+    "tab",
+    "backspace",
+    "delete",
+    "insert",
+    "home",
+    "end",
+    "page_up",
+    "page_down",
+    "left",
+    "down",
+    "up",
+    "right",
+    "f1",
+    "f2",
+    "f3",
+    "f4",
+    "f5",
+    "f6",
+    "f7",
+    "f8",
+    "f9",
+    "f10",
+    "f11",
+    "f12",
+    "minus",
+    "equals",
+    "left_square_bracket",
+    "right_square_bracket",
+    "backslash",
+    "semicolon",
+    "single_quote",
+    "grave",
+    "comma",
+    "dot",
+    "slash",
+    "volume_mute",
+    "volume_down",
+    "volume_up",
+    "media_next",
+    "media_prev",
+    "media_stop",
+    "media_play_pause",
+];
+const BUILTIN_ACTION_CHOICES: &[&str] = &[
+    "moveLeft",
+    "moveDown",
+    "moveUp",
+    "moveRight",
+    "moveWordLeft",
+    "moveWordRight",
+    "selectLeft",
+    "selectRight",
+    "selectUp",
+    "selectDown",
+    "selectWordLeft",
+    "selectWordRight",
+    "home",
+    "end",
+    "pageUp",
+    "pageDown",
+    "enter",
+    "backspace",
+    "delete",
+    "deleteWord",
+    "forwardDeleteWord",
+];
 
 static CLASS_REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
 static WINDOW_STATE: OnceLock<Mutex<Option<SettingsWindowState>>> = OnceLock::new();
@@ -299,6 +460,105 @@ fn has_ascii_case_prefix(value: &str, prefix: &str) -> bool {
         .map(|candidate| candidate.eq_ignore_ascii_case(prefix))
         .unwrap_or(false)
 }
+impl ComboEditorParts {
+    fn default_key() -> Self {
+        Self {
+            modifiers: Vec::new(),
+            key: KEY_CHOICES[0].to_string(),
+        }
+    }
+
+    fn from_key_combo(combo: &KeyCombo) -> Self {
+        Self {
+            modifiers: combo
+                .modifiers
+                .iter()
+                .map(|modifier| modifier.canonical_name().to_string())
+                .collect(),
+            key: combo.key.name.to_string(),
+        }
+    }
+}
+
+fn combo_parts_from_source(source: &str) -> ComboEditorParts {
+    parse_capslock_combo_name(source)
+        .map(|combo| ComboEditorParts::from_key_combo(&combo))
+        .unwrap_or_else(|_| ComboEditorParts::default_key())
+}
+
+fn combo_parts_from_suffix(suffix: &str) -> ComboEditorParts {
+    parse_combo_suffix(suffix)
+        .map(|combo| ComboEditorParts::from_key_combo(&combo))
+        .unwrap_or_else(|_| ComboEditorParts::default_key())
+}
+
+fn caps_source_from_parts(modifiers: &[String], key: &str) -> Result<String, String> {
+    normalized_combo_suffix_from_parts(modifiers, key).map(|suffix| format!("caps_{suffix}"))
+}
+
+fn normalized_combo_suffix_from_parts(modifiers: &[String], key: &str) -> Result<String, String> {
+    let key = key.trim();
+    if key.is_empty() || key == NO_MODIFIER_CHOICE {
+        return Err("combo key cannot be empty".to_string());
+    }
+
+    let mut parts: Vec<String> = modifiers
+        .iter()
+        .map(|modifier| modifier_choice_value(modifier))
+        .filter(|modifier| !modifier.is_empty())
+        .collect();
+    parts.push(key.to_string());
+
+    // Let the existing key parser normalize order and reject duplicate modifier families.
+    parse_combo_suffix(&parts.join("_"))
+        .map(|combo| combo.ini_suffix())
+        .map_err(|error| format!("invalid combo selection: {error}"))
+}
+
+fn modifier_choice_value(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() || value == NO_MODIFIER_CHOICE {
+        String::new()
+    } else {
+        value.to_ascii_lowercase()
+    }
+}
+fn builtin_editor_value(value: &str) -> BuiltInEditorValue {
+    let value = strip_ascii_case_prefix(value.trim(), "keyFunc_");
+    let Some(open_index) = value.find('(') else {
+        return BuiltInEditorValue {
+            name: value.to_string(),
+            count: 1,
+        };
+    };
+
+    let name = value[..open_index].trim().to_string();
+    let count = value
+        .strip_suffix(')')
+        .and_then(|text| text.get(open_index + 1..))
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+    BuiltInEditorValue { name, count }
+}
+
+fn builtin_action_value(name: &str, count: &str) -> Result<String, String> {
+    let name = strip_ascii_case_prefix(name.trim(), "keyFunc_").trim();
+    if name.is_empty() {
+        return Err("built-in action cannot be empty".to_string());
+    }
+
+    let count = count
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| format!("invalid built-in action count: {error}"))?
+        .max(1);
+    if count <= 1 {
+        Ok(name.to_string())
+    } else {
+        Ok(format!("{name}({count})"))
+    }
+}
 
 pub fn open() -> Result<(), String> {
     if let Some(hwnd) = active_window() {
@@ -394,7 +654,12 @@ fn handle_command(hwnd: HWND, command: i32, notification: u16) {
         ID_OPEN_CONFIG => app::open_config(),
         ID_OPEN_LOG => app::open_log(),
         ID_BINDING_LIST if notification == LBN_SELCHANGE => change_selected_binding(hwnd),
-        ID_BINDING_ADD => add_binding_from_window(hwnd),
+        ID_BINDING_ACTION_KIND if notification == CBN_SELCHANGE => change_binding_action_kind(hwnd),
+        ID_BINDING_SOURCE_MODIFIER_ADD => add_modifier_to_editor(hwnd, &SOURCE_MODIFIER_IDS),
+        ID_BINDING_ACTION_MODIFIER_ADD => add_modifier_to_editor(hwnd, &ACTION_MODIFIER_IDS),
+        id if is_modifier_combo(id) && notification == CBN_SELCHANGE => {
+            normalize_modifier_editor(hwnd, id)
+        }
         ID_BINDING_UPDATE => update_selected_binding_from_window(hwnd),
         ID_BINDING_DELETE => delete_selected_binding(hwnd),
         _ => {}
@@ -446,8 +711,8 @@ fn save_from_window(hwnd: HWND) {
     }
 }
 
-fn add_binding_from_window(hwnd: HWND) {
-    match add_binding_from_window_result(hwnd) {
+fn add_default_binding_from_list(hwnd: HWND) {
+    match add_default_binding_from_list_result() {
         Ok(()) => {
             let _ = refresh_bindings_area(hwnd);
             let _ = set_status(hwnd, state_language(), "settings.binding_added");
@@ -456,15 +721,19 @@ fn add_binding_from_window(hwnd: HWND) {
     }
 }
 
-fn add_binding_from_window_result(hwnd: HWND) -> Result<(), String> {
-    let row = collect_binding_editor_row(hwnd)?;
+fn add_default_binding_from_list_result() -> Result<(), String> {
     let mut state = state_holder()
         .lock()
         .map_err(|_| "settings window lock is poisoned".to_string())?;
     let state = state
         .as_mut()
         .ok_or_else(|| "settings window is not initialized".to_string())?;
-    state.model.add_binding_row(row)?;
+    let source = next_default_source(&state.model);
+    state.model.add_binding_row(KeyBindingRow::new(
+        source,
+        KeyBindingActionKind::BuiltIn,
+        default_action_value(KeyBindingActionKind::BuiltIn),
+    ))?;
     state.selected_binding_index = state.model.capslock_layer.len().checked_sub(1);
     Ok(())
 }
@@ -512,12 +781,16 @@ fn delete_selected_binding_result() -> Result<(), String> {
 
 fn change_selected_binding(hwnd: HWND) {
     let result = (|| {
-        let new_index = selected_binding_index(hwnd)?;
-        let old_index = with_state(|state| state.selected_binding_index)?;
-        if old_index != new_index {
-            commit_binding_editor_for_index(hwnd, old_index)?;
-            set_selected_binding_index(new_index)?;
+        let Some(new_index) = selected_binding_index(hwnd)? else {
+            set_selected_binding_index(None)?;
+            return populate_binding_editor(hwnd);
+        };
+        let row_count = with_state(|state| state.model.capslock_layer.len())?;
+        if new_index >= row_count {
+            add_default_binding_from_list(hwnd);
+            return Ok(());
         }
+        set_selected_binding_index(Some(new_index))?;
         populate_binding_editor(hwnd)
     })();
 
@@ -560,12 +833,36 @@ fn set_selected_binding_index(index: Option<usize>) -> Result<(), String> {
     Ok(())
 }
 
+fn change_binding_action_kind(hwnd: HWND) {
+    let language = state_language();
+    let kind = combo_index(hwnd, ID_BINDING_ACTION_KIND)
+        .and_then(KeyBindingActionKind::from_combo_index)
+        .unwrap_or(KeyBindingActionKind::BuiltIn);
+    let row = KeyBindingRow::new("caps_space", kind, default_action_value(kind));
+    if let Err(error) = populate_binding_action_editor(hwnd, language, &row) {
+        handle_binding_error(hwnd, error);
+    }
+}
 fn collect_binding_editor_row(hwnd: HWND) -> Result<KeyBindingRow, String> {
-    Ok(KeyBindingRow::new(
-        control_text(hwnd, ID_BINDING_SOURCE)?,
-        KeyBindingActionKind::from_combo_index(combo_index(hwnd, ID_BINDING_ACTION_KIND)?)?,
-        control_text(hwnd, ID_BINDING_ACTION_VALUE)?,
-    ))
+    let source_modifiers = selected_modifier_values(hwnd, &SOURCE_MODIFIER_IDS)?;
+    let source_key = control_text(hwnd, ID_BINDING_SOURCE)?;
+    let source = caps_source_from_parts(&source_modifiers, &source_key)?;
+    let action_kind =
+        KeyBindingActionKind::from_combo_index(combo_index(hwnd, ID_BINDING_ACTION_KIND)?)?;
+    let action_value = match action_kind {
+        KeyBindingActionKind::BuiltIn => builtin_action_value(
+            &control_text(hwnd, ID_BINDING_ACTION_VALUE)?,
+            &control_text(hwnd, ID_BINDING_ACTION_COUNT)?,
+        )?,
+        KeyBindingActionKind::KeyTap => control_text(hwnd, ID_BINDING_ACTION_VALUE)?,
+        KeyBindingActionKind::KeyCombo => {
+            let action_modifiers = selected_modifier_values(hwnd, &ACTION_MODIFIER_IDS)?;
+            let action_key = control_text(hwnd, ID_BINDING_ACTION_VALUE)?;
+            normalized_combo_suffix_from_parts(&action_modifiers, &action_key)?
+        }
+    };
+
+    Ok(KeyBindingRow::new(source, action_kind, action_value))
 }
 
 fn handle_binding_error(hwnd: HWND, error: String) {
@@ -606,39 +903,51 @@ fn create_controls(hwnd: HWND) -> Result<(), String> {
     create_checkbox(hwnd, ID_RUN_AS_ADMIN, 18, 78, 260, 24)?;
     create_checkbox(hwnd, ID_SHOW_TRAY_ICON, 18, 108, 260, 24)?;
 
-    create_static(hwnd, ID_TAP_CAPSLOCK_LABEL, 386, 20, 130, 22)?;
-    create_combo(hwnd, ID_TAP_CAPSLOCK, 522, 16, 190, 160)?;
+    create_static(hwnd, ID_TAP_CAPSLOCK_LABEL, 470, 20, 130, 22)?;
+    create_combo(hwnd, ID_TAP_CAPSLOCK, 610, 16, 220, 160)?;
 
-    create_static(hwnd, ID_LANGUAGE_LABEL, 386, 60, 130, 22)?;
-    create_combo(hwnd, ID_LANGUAGE, 522, 56, 190, 160)?;
+    create_static(hwnd, ID_LANGUAGE_LABEL, 470, 60, 130, 22)?;
+    create_combo(hwnd, ID_LANGUAGE, 610, 56, 220, 160)?;
 
-    create_static(hwnd, ID_CONFIG_PATH_LABEL, 18, 148, 620, 22)?;
-    create_readonly_edit(hwnd, ID_CONFIG_PATH, 18, 174, 592, 24)?;
-    create_button(hwnd, ID_OPEN_CONFIG, 624, 173, 88, 26)?;
+    create_static(hwnd, ID_CONFIG_PATH_LABEL, 18, 148, 700, 22)?;
+    create_readonly_edit(hwnd, ID_CONFIG_PATH, 18, 174, 700, 24)?;
+    create_button(hwnd, ID_OPEN_CONFIG, 732, 173, 98, 26)?;
 
-    create_static(hwnd, ID_LOG_PATH_LABEL, 18, 212, 620, 22)?;
-    create_readonly_edit(hwnd, ID_LOG_PATH, 18, 238, 592, 24)?;
-    create_button(hwnd, ID_OPEN_LOG, 624, 237, 88, 26)?;
+    create_static(hwnd, ID_LOG_PATH_LABEL, 18, 212, 700, 22)?;
+    create_readonly_edit(hwnd, ID_LOG_PATH, 18, 238, 700, 24)?;
+    create_button(hwnd, ID_OPEN_LOG, 732, 237, 98, 26)?;
 
-    create_static(hwnd, ID_BINDINGS_LABEL, 18, 286, 420, 22)?;
-    create_listbox(hwnd, ID_BINDING_LIST, 18, 314, 428, 280)?;
+    create_static(hwnd, ID_BINDINGS_LABEL, 18, 286, 450, 22)?;
+    create_listbox(hwnd, ID_BINDING_LIST, 18, 314, 450, 340)?;
 
-    create_static(hwnd, ID_BINDING_SOURCE_LABEL, 466, 314, 246, 22)?;
-    create_text_edit(hwnd, ID_BINDING_SOURCE, 466, 340, 246, 24)?;
+    create_static(hwnd, ID_BINDING_SOURCE_LABEL, 500, 314, 330, 22)?;
+    create_static(hwnd, ID_BINDING_SOURCE_PREFIX, 500, 340, 84, 24)?;
+    create_button(hwnd, ID_BINDING_SOURCE_MODIFIER_ADD, 590, 336, 28, 26)?;
+    create_combo(hwnd, ID_BINDING_SOURCE_MODIFIER_1, 590, 336, 110, 180)?;
+    create_combo(hwnd, ID_BINDING_SOURCE_MODIFIER_2, 710, 336, 110, 180)?;
+    create_combo(hwnd, ID_BINDING_SOURCE_MODIFIER_3, 500, 366, 110, 180)?;
+    create_combo(hwnd, ID_BINDING_SOURCE_MODIFIER_4, 620, 366, 110, 180)?;
+    create_combo(hwnd, ID_BINDING_SOURCE, 500, 396, 330, 260)?;
 
-    create_static(hwnd, ID_BINDING_ACTION_KIND_LABEL, 466, 378, 246, 22)?;
-    create_combo(hwnd, ID_BINDING_ACTION_KIND, 466, 404, 246, 160)?;
+    create_static(hwnd, ID_BINDING_ACTION_KIND_LABEL, 500, 438, 330, 22)?;
+    create_combo(hwnd, ID_BINDING_ACTION_KIND, 500, 464, 330, 160)?;
 
-    create_static(hwnd, ID_BINDING_ACTION_VALUE_LABEL, 466, 442, 246, 22)?;
-    create_text_edit(hwnd, ID_BINDING_ACTION_VALUE, 466, 468, 246, 24)?;
+    create_static(hwnd, ID_BINDING_ACTION_VALUE_LABEL, 500, 502, 330, 22)?;
+    create_static(hwnd, ID_BINDING_ACTION_COUNT_LABEL, 500, 566, 72, 22)?;
+    create_text_edit(hwnd, ID_BINDING_ACTION_COUNT, 500, 590, 58, 24)?;
+    create_button(hwnd, ID_BINDING_ACTION_MODIFIER_ADD, 500, 566, 28, 26)?;
+    create_combo(hwnd, ID_BINDING_ACTION_MODIFIER_1, 500, 566, 110, 180)?;
+    create_combo(hwnd, ID_BINDING_ACTION_MODIFIER_2, 610, 566, 110, 180)?;
+    create_combo(hwnd, ID_BINDING_ACTION_MODIFIER_3, 500, 596, 110, 180)?;
+    create_combo(hwnd, ID_BINDING_ACTION_MODIFIER_4, 610, 596, 110, 180)?;
+    create_combo(hwnd, ID_BINDING_ACTION_VALUE, 500, 528, 330, 260)?;
 
-    create_button(hwnd, ID_BINDING_UPDATE, 466, 518, 76, 28)?;
-    create_button(hwnd, ID_BINDING_ADD, 552, 518, 76, 28)?;
-    create_button(hwnd, ID_BINDING_DELETE, 636, 518, 76, 28)?;
+    create_button(hwnd, ID_BINDING_UPDATE, 500, 632, 88, 28)?;
+    create_button(hwnd, ID_BINDING_DELETE, 604, 632, 88, 28)?;
 
-    create_static(hwnd, ID_STATUS, 18, 624, 420, 24)?;
-    create_button(hwnd, ID_SAVE, 524, 622, 88, 28)?;
-    create_button(hwnd, ID_CLOSE, 624, 622, 88, 28)?;
+    create_static(hwnd, ID_STATUS, 18, 690, 500, 24)?;
+    create_button(hwnd, ID_SAVE, 632, 688, 88, 28)?;
+    create_button(hwnd, ID_CLOSE, 742, 688, 88, 28)?;
     Ok(())
 }
 
@@ -703,6 +1012,7 @@ fn refresh_window(hwnd: HWND, status_key: Option<&str>) -> Result<(), String> {
         ID_BINDING_SOURCE_LABEL,
         i18n::text(language, "settings.binding.source"),
     )?;
+    set_control_text(hwnd, ID_BINDING_SOURCE_PREFIX, "CapsLock +")?;
     set_control_text(
         hwnd,
         ID_BINDING_ACTION_KIND_LABEL,
@@ -715,9 +1025,11 @@ fn refresh_window(hwnd: HWND, status_key: Option<&str>) -> Result<(), String> {
     )?;
     set_control_text(
         hwnd,
-        ID_BINDING_ADD,
-        i18n::text(language, "settings.binding.add"),
+        ID_BINDING_ACTION_COUNT_LABEL,
+        i18n::text(language, "settings.binding.action_count"),
     )?;
+    set_control_text(hwnd, ID_BINDING_SOURCE_MODIFIER_ADD, "+")?;
+    set_control_text(hwnd, ID_BINDING_ACTION_MODIFIER_ADD, "+")?;
     set_control_text(
         hwnd,
         ID_BINDING_UPDATE,
@@ -791,6 +1103,11 @@ fn populate_binding_list(
         }
     }
 
+    let add_item = win::to_wide_null(&binding_add_list_text(language));
+    unsafe {
+        SendMessageW(control, LB_ADDSTRING, 0, add_item.as_ptr() as LPARAM);
+    }
+
     set_list_selection(hwnd, selected)
 }
 
@@ -799,14 +1116,220 @@ fn populate_binding_editor(hwnd: HWND) -> Result<(), String> {
     let language = model.language;
     let row = selected
         .and_then(|index| model.binding_rows().get(index).cloned())
-        .unwrap_or_else(|| KeyBindingRow::new("", KeyBindingActionKind::BuiltIn, ""));
+        .unwrap_or_else(|| {
+            KeyBindingRow::new(
+                "caps_space",
+                KeyBindingActionKind::BuiltIn,
+                default_action_value(KeyBindingActionKind::BuiltIn),
+            )
+        });
 
-    set_control_text(hwnd, ID_BINDING_SOURCE, &row.source)?;
+    populate_binding_source_editor(hwnd, &row)?;
     populate_binding_action_kind(hwnd, language, row.action_kind)?;
-    set_control_text(hwnd, ID_BINDING_ACTION_VALUE, &row.action_value)?;
+    populate_binding_action_editor(hwnd, language, &row)?;
     Ok(())
 }
 
+fn populate_binding_source_editor(hwnd: HWND, row: &KeyBindingRow) -> Result<(), String> {
+    let parts = combo_parts_from_source(&row.source);
+    populate_modifier_combos(hwnd, &SOURCE_MODIFIER_IDS, &parts.modifiers)?;
+    refresh_modifier_editor_visibility(hwnd, &SOURCE_MODIFIER_IDS)?;
+    populate_combo_values(hwnd, ID_BINDING_SOURCE, KEY_CHOICES, &parts.key)
+}
+
+fn populate_binding_action_editor(
+    hwnd: HWND,
+    _language: Language,
+    row: &KeyBindingRow,
+) -> Result<(), String> {
+    match row.action_kind {
+        KeyBindingActionKind::BuiltIn => {
+            show_combo_modifier_editor(hwnd, &ACTION_MODIFIER_IDS, false)?;
+            show_builtin_count_editor(hwnd, true)?;
+            let builtin = builtin_editor_value(&row.action_value);
+            set_control_text(hwnd, ID_BINDING_ACTION_COUNT, &builtin.count.to_string())?;
+            populate_combo_values(
+                hwnd,
+                ID_BINDING_ACTION_VALUE,
+                BUILTIN_ACTION_CHOICES,
+                &builtin.name,
+            )
+        }
+        KeyBindingActionKind::KeyTap => {
+            show_combo_modifier_editor(hwnd, &ACTION_MODIFIER_IDS, false)?;
+            show_builtin_count_editor(hwnd, false)?;
+            populate_combo_values(
+                hwnd,
+                ID_BINDING_ACTION_VALUE,
+                KEY_CHOICES,
+                &row.action_value,
+            )
+        }
+        KeyBindingActionKind::KeyCombo => {
+            show_builtin_count_editor(hwnd, false)?;
+            let parts = combo_parts_from_suffix(&row.action_value);
+            populate_modifier_combos(hwnd, &ACTION_MODIFIER_IDS, &parts.modifiers)?;
+            refresh_modifier_editor_visibility(hwnd, &ACTION_MODIFIER_IDS)?;
+            populate_combo_values(hwnd, ID_BINDING_ACTION_VALUE, KEY_CHOICES, &parts.key)
+        }
+    }
+}
+
+fn populate_modifier_combos(
+    hwnd: HWND,
+    ids: &[i32],
+    selected_modifiers: &[String],
+) -> Result<(), String> {
+    for (index, id) in ids.iter().enumerate() {
+        let selected = selected_modifiers
+            .get(index)
+            .map(String::as_str)
+            .unwrap_or(NO_MODIFIER_CHOICE);
+        populate_combo_values(hwnd, *id, MODIFIER_CHOICES, selected)?;
+    }
+    Ok(())
+}
+
+fn selected_modifier_values(hwnd: HWND, ids: &[i32]) -> Result<Vec<String>, String> {
+    let mut modifiers = Vec::new();
+    for id in ids {
+        let value = modifier_choice_value(&control_text(hwnd, *id)?);
+        if !value.is_empty() {
+            modifiers.push(value);
+        }
+    }
+    Ok(modifiers)
+}
+
+fn add_modifier_to_editor(hwnd: HWND, ids: &[i32]) {
+    let result = (|| {
+        let mut modifiers = selected_modifier_values(hwnd, ids)?;
+        if modifiers.len() < ids.len() {
+            modifiers.push(next_modifier_choice(&modifiers).to_string());
+        }
+        populate_modifier_combos(hwnd, ids, &modifiers)?;
+        refresh_modifier_editor_visibility(hwnd, ids)
+    })();
+
+    if let Err(error) = result {
+        handle_binding_error(hwnd, error);
+    }
+}
+
+fn normalize_modifier_editor(hwnd: HWND, changed_id: i32) {
+    let ids = if SOURCE_MODIFIER_IDS.contains(&changed_id) {
+        &SOURCE_MODIFIER_IDS
+    } else {
+        &ACTION_MODIFIER_IDS
+    };
+    let result = (|| {
+        let modifiers = selected_modifier_values(hwnd, ids)?;
+        populate_modifier_combos(hwnd, ids, &modifiers)?;
+        refresh_modifier_editor_visibility(hwnd, ids)
+    })();
+
+    if let Err(error) = result {
+        handle_binding_error(hwnd, error);
+    }
+}
+
+fn refresh_modifier_editor_visibility(hwnd: HWND, ids: &[i32]) -> Result<(), String> {
+    let count = selected_modifier_values(hwnd, ids)?.len();
+    for (index, id) in ids.iter().enumerate() {
+        show_control(hwnd, *id, index < count)?;
+    }
+
+    let add_id = modifier_add_button_id(ids);
+    show_control(hwnd, add_id, count < ids.len())?;
+    let (x, y) = modifier_add_button_position(ids, count);
+    move_control(hwnd, add_id, x, y, 28, 26)
+}
+
+fn show_combo_modifier_editor(hwnd: HWND, ids: &[i32], visible: bool) -> Result<(), String> {
+    for id in ids {
+        show_control(hwnd, *id, visible)?;
+    }
+    show_control(hwnd, modifier_add_button_id(ids), visible)
+}
+
+fn show_builtin_count_editor(hwnd: HWND, visible: bool) -> Result<(), String> {
+    show_control(hwnd, ID_BINDING_ACTION_COUNT_LABEL, visible)?;
+    show_control(hwnd, ID_BINDING_ACTION_COUNT, visible)
+}
+
+fn is_modifier_combo(id: i32) -> bool {
+    SOURCE_MODIFIER_IDS.contains(&id) || ACTION_MODIFIER_IDS.contains(&id)
+}
+
+fn next_modifier_choice(existing: &[String]) -> &'static str {
+    ["ctrl", "alt", "shift", "win"]
+        .into_iter()
+        .find(|candidate| !existing.iter().any(|value| value == candidate))
+        .unwrap_or("ctrl")
+}
+
+fn modifier_add_button_id(ids: &[i32]) -> i32 {
+    if ids.first() == SOURCE_MODIFIER_IDS.first() {
+        ID_BINDING_SOURCE_MODIFIER_ADD
+    } else {
+        ID_BINDING_ACTION_MODIFIER_ADD
+    }
+}
+
+fn modifier_add_button_position(ids: &[i32], count: usize) -> (i32, i32) {
+    let source_positions = [(590, 336), (700, 336), (500, 366), (610, 366)];
+    let action_positions = [(500, 566), (610, 566), (500, 596), (610, 596)];
+    let positions = if ids.first() == SOURCE_MODIFIER_IDS.first() {
+        &source_positions
+    } else {
+        &action_positions
+    };
+    positions[count.min(positions.len() - 1)]
+}
+fn populate_combo_values(
+    hwnd: HWND,
+    id: i32,
+    base_items: &[&str],
+    selected: &str,
+) -> Result<(), String> {
+    let control = control(hwnd, id)?;
+    unsafe {
+        SendMessageW(control, CB_RESETCONTENT, 0, 0);
+    }
+
+    let mut selected_index = 0usize;
+    let mut found_selected = false;
+    for (index, item) in base_items.iter().enumerate() {
+        if item.eq_ignore_ascii_case(selected) {
+            selected_index = index;
+            found_selected = true;
+        }
+        let item = win::to_wide_null(item);
+        unsafe {
+            SendMessageW(control, CB_ADDSTRING, 0, item.as_ptr() as LPARAM);
+        }
+    }
+
+    if !found_selected && !selected.trim().is_empty() {
+        selected_index = base_items.len();
+        let item = win::to_wide_null(selected.trim());
+        unsafe {
+            SendMessageW(control, CB_ADDSTRING, 0, item.as_ptr() as LPARAM);
+        }
+    }
+
+    unsafe {
+        SendMessageW(control, CB_SETCURSEL, selected_index, 0);
+    }
+    Ok(())
+}
+
+fn default_action_value(kind: KeyBindingActionKind) -> &'static str {
+    match kind {
+        KeyBindingActionKind::BuiltIn => BUILTIN_ACTION_CHOICES[0],
+        KeyBindingActionKind::KeyTap | KeyBindingActionKind::KeyCombo => KEY_CHOICES[0],
+    }
+}
 fn populate_binding_action_kind(
     hwnd: HWND,
     language: Language,
@@ -827,6 +1350,26 @@ fn binding_list_text(language: Language, row: &KeyBindingRow) -> String {
         binding_action_kind_text(language, row.action_kind),
         row.action_value
     )
+}
+fn binding_add_list_text(language: Language) -> String {
+    format!("+ {}", i18n::text(language, "settings.binding.add"))
+}
+
+fn next_default_source(model: &SettingsModel) -> String {
+    let existing: Vec<String> = model
+        .binding_rows()
+        .into_iter()
+        .map(|row| row.source.to_ascii_lowercase())
+        .collect();
+    KEY_CHOICES
+        .iter()
+        .map(|key| format!("caps_{key}"))
+        .find(|source| {
+            !existing
+                .iter()
+                .any(|existing| existing == &source.to_ascii_lowercase())
+        })
+        .unwrap_or_else(|| "caps_space".to_string())
 }
 
 fn binding_action_kind_text(language: Language, kind: KeyBindingActionKind) -> &'static str {
@@ -1088,7 +1631,7 @@ fn create_combo(
         hwnd,
         "COMBOBOX",
         "",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST as u32,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
         id,
         x,
         y,
@@ -1177,6 +1720,29 @@ fn control_text(hwnd: HWND, id: i32) -> Result<String, String> {
     let mut buffer = vec![0u16; length as usize + 1];
     let copied = unsafe { GetWindowTextW(control, buffer.as_mut_ptr(), buffer.len() as i32) };
     Ok(String::from_utf16_lossy(&buffer[..copied as usize]))
+}
+
+fn show_control(hwnd: HWND, id: i32, visible: bool) -> Result<(), String> {
+    let control = control(hwnd, id)?;
+    unsafe {
+        ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE });
+    }
+    Ok(())
+}
+
+fn move_control(
+    hwnd: HWND,
+    id: i32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<(), String> {
+    let control = control(hwnd, id)?;
+    unsafe {
+        MoveWindow(control, x, y, width, height, 1);
+    }
+    Ok(())
 }
 
 fn control(hwnd: HWND, id: i32) -> Result<HWND, String> {
@@ -1342,5 +1908,40 @@ mod tests {
         assert!(ini.contains("caps_r=keyTarget_f5"));
         assert!(ini.contains("caps_c=keyCombo_ctrl_c"));
         assert_eq!(reparsed_model.binding_rows(), rows);
+    }
+
+    #[test]
+    fn combo_dropdown_parts_build_normalized_binding_values() {
+        let source_modifiers = vec![String::new()];
+        let action_modifiers = vec!["ctrl".to_string()];
+
+        assert_eq!(
+            caps_source_from_parts(&source_modifiers, "space").unwrap(),
+            "caps_space"
+        );
+        assert_eq!(
+            normalized_combo_suffix_from_parts(&action_modifiers, "space").unwrap(),
+            "ctrl_space"
+        );
+    }
+
+    #[test]
+    fn builtin_dropdown_value_round_trips_custom_count() {
+        assert_eq!(
+            builtin_action_value("moveLeft", "12").unwrap(),
+            "moveLeft(12)"
+        );
+        assert_eq!(builtin_action_value("moveLeft", "1").unwrap(), "moveLeft");
+
+        let parsed = builtin_editor_value("moveDown(7)");
+        assert_eq!(parsed.name, "moveDown");
+        assert_eq!(parsed.count, 7);
+    }
+
+    #[test]
+    fn default_added_binding_uses_first_free_key_choice() {
+        let model = SettingsModel::from_config(&Config::default());
+
+        assert_ne!(next_default_source(&model), "caps_space");
     }
 }
