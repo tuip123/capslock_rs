@@ -8,15 +8,15 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT, HBRUSH};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetDlgItem, IsWindow, LoadCursorW,
-    RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, BS_AUTOCHECKBOX,
-    BS_PUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL,
-    CW_USEDEFAULT, ES_AUTOHSCROLL, ES_READONLY, HMENU, IDC_ARROW, SW_SHOW, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX,
-    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetDlgItem, GetWindowTextLengthW,
+    GetWindowTextW, IsWindow, LoadCursorW, RegisterClassW, SendMessageW, SetForegroundWindow,
+    SetWindowTextW, ShowWindow, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING,
+    CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_READONLY, HMENU,
+    IDC_ARROW, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_BORDER,
+    WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
-use crate::config::{Config, KeyMapping, Language, TapCapsLock};
+use crate::config::{Config, ConfigIssue, KeyMapping, Language, LayerAction, TapCapsLock};
 use crate::{app, i18n, logging, win};
 
 #[derive(Clone, Debug)]
@@ -30,16 +30,31 @@ pub struct SettingsModel {
     pub capslock_layer: Vec<KeyMapping>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyBindingActionKind {
+    BuiltIn,
+    KeyTap,
+    KeyCombo,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyBindingRow {
+    pub source: String,
+    pub action_kind: KeyBindingActionKind,
+    pub action_value: String,
+}
+
 struct SettingsWindowState {
     hwnd: isize,
     model: SettingsModel,
     config_path: PathBuf,
     log_path: PathBuf,
+    selected_binding_index: Option<usize>,
 }
 
 const CLASS_NAME: &str = "CapsLockRSSettingsWindow";
-const WINDOW_WIDTH: i32 = 600;
-const WINDOW_HEIGHT: i32 = 430;
+const WINDOW_WIDTH: i32 = 760;
+const WINDOW_HEIGHT: i32 = 700;
 
 const ID_ENABLED: i32 = 3001;
 const ID_START_WITH_WINDOWS: i32 = 3002;
@@ -58,6 +73,17 @@ const ID_OPEN_LOG: i32 = 3014;
 const ID_STATUS: i32 = 3015;
 const ID_SAVE: i32 = 3016;
 const ID_CLOSE: i32 = 3017;
+const ID_BINDINGS_LABEL: i32 = 3018;
+const ID_BINDING_LIST: i32 = 3019;
+const ID_BINDING_SOURCE_LABEL: i32 = 3020;
+const ID_BINDING_SOURCE: i32 = 3021;
+const ID_BINDING_ACTION_KIND_LABEL: i32 = 3022;
+const ID_BINDING_ACTION_KIND: i32 = 3023;
+const ID_BINDING_ACTION_VALUE_LABEL: i32 = 3024;
+const ID_BINDING_ACTION_VALUE: i32 = 3025;
+const ID_BINDING_ADD: i32 = 3026;
+const ID_BINDING_UPDATE: i32 = 3027;
+const ID_BINDING_DELETE: i32 = 3028;
 
 const BM_GETCHECK: u32 = 0x00F0;
 const BM_SETCHECK: u32 = 0x00F1;
@@ -65,6 +91,15 @@ const BST_CHECKED: u32 = 1;
 const BST_UNCHECKED: u32 = 0;
 const COLOR_WINDOW: i32 = 5;
 const SS_LEFT: u32 = 0;
+const LBS_NOTIFY: u32 = 0x0001;
+const LBS_NOINTEGRALHEIGHT: u32 = 0x0100;
+const LB_ADDSTRING: u32 = 0x0180;
+const LB_RESETCONTENT: u32 = 0x0184;
+const LB_GETCURSEL: u32 = 0x0188;
+const LB_SETCURSEL: u32 = 0x0186;
+const LB_ERR: isize = -1;
+const LBN_SELCHANGE: u16 = 1;
+const WS_VSCROLL: u32 = 0x00200000;
 
 static CLASS_REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
 static WINDOW_STATE: OnceLock<Mutex<Option<SettingsWindowState>>> = OnceLock::new();
@@ -91,6 +126,178 @@ impl SettingsModel {
         config.ui.language = self.language;
         config.capslock_layer = self.capslock_layer.clone();
     }
+}
+impl SettingsModel {
+    pub fn binding_rows(&self) -> Vec<KeyBindingRow> {
+        self.capslock_layer
+            .iter()
+            .map(KeyBindingRow::from_mapping)
+            .collect()
+    }
+
+    pub fn replace_binding_rows(&mut self, rows: Vec<KeyBindingRow>) -> Result<(), String> {
+        self.capslock_layer = parse_binding_rows(&rows)?;
+        Ok(())
+    }
+
+    pub fn add_binding_row(&mut self, row: KeyBindingRow) -> Result<(), String> {
+        let mut rows = self.binding_rows();
+        rows.push(row);
+        self.replace_binding_rows(rows)
+    }
+
+    pub fn update_binding_row(&mut self, index: usize, row: KeyBindingRow) -> Result<(), String> {
+        let mut rows = self.binding_rows();
+        let Some(slot) = rows.get_mut(index) else {
+            return Err(format!("binding row {index} was not found"));
+        };
+        *slot = row;
+        self.replace_binding_rows(rows)
+    }
+
+    pub fn delete_binding_row(&mut self, index: usize) -> Result<(), String> {
+        let mut rows = self.binding_rows();
+        if index >= rows.len() {
+            return Err(format!("binding row {index} was not found"));
+        }
+        rows.remove(index);
+        self.replace_binding_rows(rows)
+    }
+}
+
+impl KeyBindingRow {
+    pub fn new(
+        source: impl Into<String>,
+        action_kind: KeyBindingActionKind,
+        action_value: impl Into<String>,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            action_kind,
+            action_value: action_value.into(),
+        }
+    }
+
+    fn from_mapping(mapping: &KeyMapping) -> Self {
+        let (action_kind, action_value) = match &mapping.action {
+            LayerAction::BuiltIn(action) => {
+                let value = strip_ascii_case_prefix(&action.as_key_func(), "keyFunc_").to_string();
+                (KeyBindingActionKind::BuiltIn, value)
+            }
+            LayerAction::KeyTap(key) => (KeyBindingActionKind::KeyTap, key.name.to_string()),
+            LayerAction::KeyCombo(combo) => (KeyBindingActionKind::KeyCombo, combo.ini_suffix()),
+        };
+
+        Self {
+            source: mapping.source.capslock_ini_key(),
+            action_kind,
+            action_value,
+        }
+    }
+
+    fn source_ini_key(&self) -> Result<String, String> {
+        let source = self.source.trim();
+        if source.is_empty() {
+            return Err("binding source cannot be empty".to_string());
+        }
+        if has_ascii_case_prefix(source, "caps_") {
+            Ok(source.to_string())
+        } else {
+            Ok(format!("caps_{source}"))
+        }
+    }
+
+    fn action_ini_value(&self) -> Result<String, String> {
+        let value = self.action_value.trim();
+        if value.is_empty() {
+            return Err("binding action value cannot be empty".to_string());
+        }
+
+        let prefix = match self.action_kind {
+            KeyBindingActionKind::BuiltIn => "keyFunc_",
+            KeyBindingActionKind::KeyTap => "keyTarget_",
+            KeyBindingActionKind::KeyCombo => "keyCombo_",
+        };
+        Ok(ensure_ascii_case_prefix(value, prefix))
+    }
+}
+
+impl KeyBindingActionKind {
+    fn combo_index(self) -> usize {
+        match self {
+            KeyBindingActionKind::BuiltIn => 0,
+            KeyBindingActionKind::KeyTap => 1,
+            KeyBindingActionKind::KeyCombo => 2,
+        }
+    }
+
+    fn from_combo_index(index: isize) -> Result<Self, String> {
+        match index {
+            0 => Ok(KeyBindingActionKind::BuiltIn),
+            1 => Ok(KeyBindingActionKind::KeyTap),
+            2 => Ok(KeyBindingActionKind::KeyCombo),
+            _ => Err("binding action type is not selected".to_string()),
+        }
+    }
+}
+
+fn parse_binding_rows(rows: &[KeyBindingRow]) -> Result<Vec<KeyMapping>, String> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut content = String::from("[Keys]\n");
+    for row in rows {
+        content.push_str(&row.source_ini_key()?);
+        content.push('=');
+        content.push_str(&row.action_ini_value()?);
+        content.push('\n');
+    }
+
+    // Use the real config parser so GUI validation cannot drift from INI semantics.
+    let parsed = Config::from_ini_with_validation(&content);
+    if !parsed.validation.issues.is_empty() {
+        return Err(format_config_issues(&parsed.validation.issues));
+    }
+    if parsed.config.capslock_layer.len() != rows.len() {
+        return Err("some binding rows were ignored by the config parser".to_string());
+    }
+
+    Ok(parsed.config.capslock_layer)
+}
+
+fn format_config_issues(issues: &[ConfigIssue]) -> String {
+    let messages: Vec<String> = issues
+        .iter()
+        .map(|issue| match issue.line {
+            Some(line) => format!("line {line}: {}", issue.message),
+            None => issue.message.clone(),
+        })
+        .collect();
+    messages.join("; ")
+}
+
+fn ensure_ascii_case_prefix(value: &str, prefix: &str) -> String {
+    if has_ascii_case_prefix(value, prefix) {
+        value.to_string()
+    } else {
+        format!("{prefix}{value}")
+    }
+}
+
+fn strip_ascii_case_prefix<'a>(value: &'a str, prefix: &str) -> &'a str {
+    if has_ascii_case_prefix(value, prefix) {
+        &value[prefix.len()..]
+    } else {
+        value
+    }
+}
+
+fn has_ascii_case_prefix(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .map(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .unwrap_or(false)
 }
 
 pub fn open() -> Result<(), String> {
@@ -136,6 +343,7 @@ pub fn open() -> Result<(), String> {
             model: snapshot.model,
             config_path: snapshot.config_path,
             log_path: snapshot.log_path,
+            selected_binding_index: None,
         });
     }
 
@@ -158,7 +366,11 @@ unsafe extern "system" fn window_proc(
 ) -> LRESULT {
     match message {
         WM_COMMAND => {
-            handle_command(hwnd, (w_param & 0xffff) as i32);
+            handle_command(
+                hwnd,
+                (w_param & 0xffff) as i32,
+                ((w_param >> 16) & 0xffff) as u16,
+            );
             0
         }
         WM_CLOSE => {
@@ -173,7 +385,7 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-fn handle_command(hwnd: HWND, command: i32) {
+fn handle_command(hwnd: HWND, command: i32, notification: u16) {
     match command {
         ID_SAVE => save_from_window(hwnd),
         ID_CLOSE => unsafe {
@@ -181,6 +393,10 @@ fn handle_command(hwnd: HWND, command: i32) {
         },
         ID_OPEN_CONFIG => app::open_config(),
         ID_OPEN_LOG => app::open_log(),
+        ID_BINDING_LIST if notification == LBN_SELCHANGE => change_selected_binding(hwnd),
+        ID_BINDING_ADD => add_binding_from_window(hwnd),
+        ID_BINDING_UPDATE => update_selected_binding_from_window(hwnd),
+        ID_BINDING_DELETE => delete_selected_binding(hwnd),
         _ => {}
     }
 }
@@ -204,11 +420,15 @@ fn save_from_window(hwnd: HWND) {
         Ok(()) => match app::settings_snapshot() {
             Ok(snapshot) => {
                 if let Ok(mut state) = state_holder().lock() {
+                    let selected_binding_index = state
+                        .as_ref()
+                        .and_then(|state| state.selected_binding_index);
                     *state = Some(SettingsWindowState {
                         hwnd: hwnd as isize,
                         model: snapshot.model,
                         config_path: snapshot.config_path,
                         log_path: snapshot.log_path,
+                        selected_binding_index,
                     });
                 }
                 let _ = refresh_window(hwnd, Some("settings.saved"));
@@ -226,6 +446,134 @@ fn save_from_window(hwnd: HWND) {
     }
 }
 
+fn add_binding_from_window(hwnd: HWND) {
+    match add_binding_from_window_result(hwnd) {
+        Ok(()) => {
+            let _ = refresh_bindings_area(hwnd);
+            let _ = set_status(hwnd, state_language(), "settings.binding_added");
+        }
+        Err(error) => handle_binding_error(hwnd, error),
+    }
+}
+
+fn add_binding_from_window_result(hwnd: HWND) -> Result<(), String> {
+    let row = collect_binding_editor_row(hwnd)?;
+    let mut state = state_holder()
+        .lock()
+        .map_err(|_| "settings window lock is poisoned".to_string())?;
+    let state = state
+        .as_mut()
+        .ok_or_else(|| "settings window is not initialized".to_string())?;
+    state.model.add_binding_row(row)?;
+    state.selected_binding_index = state.model.capslock_layer.len().checked_sub(1);
+    Ok(())
+}
+
+fn update_selected_binding_from_window(hwnd: HWND) {
+    match commit_current_binding_editor(hwnd) {
+        Ok(()) => {
+            let _ = refresh_bindings_area(hwnd);
+            let _ = set_status(hwnd, state_language(), "settings.binding_updated");
+        }
+        Err(error) => handle_binding_error(hwnd, error),
+    }
+}
+
+fn delete_selected_binding(hwnd: HWND) {
+    match delete_selected_binding_result() {
+        Ok(()) => {
+            let _ = refresh_bindings_area(hwnd);
+            let _ = set_status(hwnd, state_language(), "settings.binding_deleted");
+        }
+        Err(error) => handle_binding_error(hwnd, error),
+    }
+}
+
+fn delete_selected_binding_result() -> Result<(), String> {
+    let mut state = state_holder()
+        .lock()
+        .map_err(|_| "settings window lock is poisoned".to_string())?;
+    let state = state
+        .as_mut()
+        .ok_or_else(|| "settings window is not initialized".to_string())?;
+    let Some(index) = state.selected_binding_index else {
+        return Err("no binding row is selected".to_string());
+    };
+
+    state.model.delete_binding_row(index)?;
+    let len = state.model.capslock_layer.len();
+    state.selected_binding_index = if len == 0 {
+        None
+    } else {
+        Some(index.min(len - 1))
+    };
+    Ok(())
+}
+
+fn change_selected_binding(hwnd: HWND) {
+    let result = (|| {
+        let new_index = selected_binding_index(hwnd)?;
+        let old_index = with_state(|state| state.selected_binding_index)?;
+        if old_index != new_index {
+            commit_binding_editor_for_index(hwnd, old_index)?;
+            set_selected_binding_index(new_index)?;
+        }
+        populate_binding_editor(hwnd)
+    })();
+
+    if let Err(error) = result {
+        let previous_index = with_state(|state| state.selected_binding_index)
+            .ok()
+            .flatten();
+        let _ = set_list_selection(hwnd, previous_index);
+        handle_binding_error(hwnd, error);
+    }
+}
+
+fn commit_current_binding_editor(hwnd: HWND) -> Result<(), String> {
+    let selected = with_state(|state| state.selected_binding_index)?;
+    commit_binding_editor_for_index(hwnd, selected)
+}
+
+fn commit_binding_editor_for_index(hwnd: HWND, index: Option<usize>) -> Result<(), String> {
+    let Some(index) = index else {
+        return Ok(());
+    };
+    let row = collect_binding_editor_row(hwnd)?;
+    let mut state = state_holder()
+        .lock()
+        .map_err(|_| "settings window lock is poisoned".to_string())?;
+    let state = state
+        .as_mut()
+        .ok_or_else(|| "settings window is not initialized".to_string())?;
+    state.model.update_binding_row(index, row)
+}
+
+fn set_selected_binding_index(index: Option<usize>) -> Result<(), String> {
+    let mut state = state_holder()
+        .lock()
+        .map_err(|_| "settings window lock is poisoned".to_string())?;
+    let state = state
+        .as_mut()
+        .ok_or_else(|| "settings window is not initialized".to_string())?;
+    state.selected_binding_index = index;
+    Ok(())
+}
+
+fn collect_binding_editor_row(hwnd: HWND) -> Result<KeyBindingRow, String> {
+    Ok(KeyBindingRow::new(
+        control_text(hwnd, ID_BINDING_SOURCE)?,
+        KeyBindingActionKind::from_combo_index(combo_index(hwnd, ID_BINDING_ACTION_KIND)?)?,
+        control_text(hwnd, ID_BINDING_ACTION_VALUE)?,
+    ))
+}
+
+fn handle_binding_error(hwnd: HWND, error: String) {
+    let language = state_language();
+    logging::log_line(format!("failed to update key binding list: {error}"));
+    let _ = set_status(hwnd, language, "settings.binding_failed");
+    show_settings_error(language, "error.update_binding_failed", &error);
+}
 fn register_class() -> Result<(), String> {
     CLASS_REGISTERED
         .get_or_init(|| {
@@ -258,23 +606,39 @@ fn create_controls(hwnd: HWND) -> Result<(), String> {
     create_checkbox(hwnd, ID_RUN_AS_ADMIN, 18, 78, 260, 24)?;
     create_checkbox(hwnd, ID_SHOW_TRAY_ICON, 18, 108, 260, 24)?;
 
-    create_static(hwnd, ID_TAP_CAPSLOCK_LABEL, 18, 150, 150, 22)?;
-    create_combo(hwnd, ID_TAP_CAPSLOCK, 178, 146, 180, 160)?;
+    create_static(hwnd, ID_TAP_CAPSLOCK_LABEL, 386, 20, 130, 22)?;
+    create_combo(hwnd, ID_TAP_CAPSLOCK, 522, 16, 190, 160)?;
 
-    create_static(hwnd, ID_LANGUAGE_LABEL, 18, 186, 150, 22)?;
-    create_combo(hwnd, ID_LANGUAGE, 178, 182, 180, 160)?;
+    create_static(hwnd, ID_LANGUAGE_LABEL, 386, 60, 130, 22)?;
+    create_combo(hwnd, ID_LANGUAGE, 522, 56, 190, 160)?;
 
-    create_static(hwnd, ID_CONFIG_PATH_LABEL, 18, 226, 420, 22)?;
-    create_readonly_edit(hwnd, ID_CONFIG_PATH, 18, 252, 452, 24)?;
-    create_button(hwnd, ID_OPEN_CONFIG, 482, 251, 82, 26)?;
+    create_static(hwnd, ID_CONFIG_PATH_LABEL, 18, 148, 620, 22)?;
+    create_readonly_edit(hwnd, ID_CONFIG_PATH, 18, 174, 592, 24)?;
+    create_button(hwnd, ID_OPEN_CONFIG, 624, 173, 88, 26)?;
 
-    create_static(hwnd, ID_LOG_PATH_LABEL, 18, 290, 420, 22)?;
-    create_readonly_edit(hwnd, ID_LOG_PATH, 18, 316, 452, 24)?;
-    create_button(hwnd, ID_OPEN_LOG, 482, 315, 82, 26)?;
+    create_static(hwnd, ID_LOG_PATH_LABEL, 18, 212, 620, 22)?;
+    create_readonly_edit(hwnd, ID_LOG_PATH, 18, 238, 592, 24)?;
+    create_button(hwnd, ID_OPEN_LOG, 624, 237, 88, 26)?;
 
-    create_static(hwnd, ID_STATUS, 18, 358, 300, 24)?;
-    create_button(hwnd, ID_SAVE, 372, 356, 88, 28)?;
-    create_button(hwnd, ID_CLOSE, 476, 356, 88, 28)?;
+    create_static(hwnd, ID_BINDINGS_LABEL, 18, 286, 420, 22)?;
+    create_listbox(hwnd, ID_BINDING_LIST, 18, 314, 428, 280)?;
+
+    create_static(hwnd, ID_BINDING_SOURCE_LABEL, 466, 314, 246, 22)?;
+    create_text_edit(hwnd, ID_BINDING_SOURCE, 466, 340, 246, 24)?;
+
+    create_static(hwnd, ID_BINDING_ACTION_KIND_LABEL, 466, 378, 246, 22)?;
+    create_combo(hwnd, ID_BINDING_ACTION_KIND, 466, 404, 246, 160)?;
+
+    create_static(hwnd, ID_BINDING_ACTION_VALUE_LABEL, 466, 442, 246, 22)?;
+    create_text_edit(hwnd, ID_BINDING_ACTION_VALUE, 466, 468, 246, 24)?;
+
+    create_button(hwnd, ID_BINDING_UPDATE, 466, 518, 76, 28)?;
+    create_button(hwnd, ID_BINDING_ADD, 552, 518, 76, 28)?;
+    create_button(hwnd, ID_BINDING_DELETE, 636, 518, 76, 28)?;
+
+    create_static(hwnd, ID_STATUS, 18, 624, 420, 24)?;
+    create_button(hwnd, ID_SAVE, 524, 622, 88, 28)?;
+    create_button(hwnd, ID_CLOSE, 624, 622, 88, 28)?;
     Ok(())
 }
 
@@ -329,6 +693,41 @@ fn refresh_window(hwnd: HWND, status_key: Option<&str>) -> Result<(), String> {
     set_control_text(hwnd, ID_OPEN_LOG, i18n::text(language, "settings.open"))?;
     set_control_text(hwnd, ID_SAVE, i18n::text(language, "settings.save"))?;
     set_control_text(hwnd, ID_CLOSE, i18n::text(language, "settings.close"))?;
+    set_control_text(
+        hwnd,
+        ID_BINDINGS_LABEL,
+        i18n::text(language, "settings.bindings"),
+    )?;
+    set_control_text(
+        hwnd,
+        ID_BINDING_SOURCE_LABEL,
+        i18n::text(language, "settings.binding.source"),
+    )?;
+    set_control_text(
+        hwnd,
+        ID_BINDING_ACTION_KIND_LABEL,
+        i18n::text(language, "settings.binding.action_kind"),
+    )?;
+    set_control_text(
+        hwnd,
+        ID_BINDING_ACTION_VALUE_LABEL,
+        i18n::text(language, "settings.binding.action_value"),
+    )?;
+    set_control_text(
+        hwnd,
+        ID_BINDING_ADD,
+        i18n::text(language, "settings.binding.add"),
+    )?;
+    set_control_text(
+        hwnd,
+        ID_BINDING_UPDATE,
+        i18n::text(language, "settings.binding.update"),
+    )?;
+    set_control_text(
+        hwnd,
+        ID_BINDING_DELETE,
+        i18n::text(language, "settings.binding.delete"),
+    )?;
 
     set_checkbox(hwnd, ID_ENABLED, model.enabled)?;
     set_checkbox(hwnd, ID_START_WITH_WINDOWS, model.start_with_windows)?;
@@ -339,6 +738,7 @@ fn refresh_window(hwnd: HWND, status_key: Option<&str>) -> Result<(), String> {
 
     set_control_text(hwnd, ID_CONFIG_PATH, &config_path.to_string_lossy())?;
     set_control_text(hwnd, ID_LOG_PATH, &log_path.to_string_lossy())?;
+    refresh_bindings_area(hwnd)?;
 
     match status_key {
         Some(key) => set_control_text(hwnd, ID_STATUS, i18n::text(language, key))?,
@@ -348,7 +748,119 @@ fn refresh_window(hwnd: HWND, status_key: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+fn refresh_bindings_area(hwnd: HWND) -> Result<(), String> {
+    let (model, selected) = current_bindings_view()?;
+    let language = model.language;
+    populate_binding_list(hwnd, language, &model, selected)?;
+    populate_binding_editor(hwnd)
+}
+
+fn current_bindings_view() -> Result<(SettingsModel, Option<usize>), String> {
+    let mut state = state_holder()
+        .lock()
+        .map_err(|_| "settings window lock is poisoned".to_string())?;
+    let state = state
+        .as_mut()
+        .ok_or_else(|| "settings window is not initialized".to_string())?;
+    let len = state.model.capslock_layer.len();
+    if state
+        .selected_binding_index
+        .map(|index| index >= len)
+        .unwrap_or(true)
+    {
+        state.selected_binding_index = if len == 0 { None } else { Some(0) };
+    }
+    Ok((state.model.clone(), state.selected_binding_index))
+}
+
+fn populate_binding_list(
+    hwnd: HWND,
+    language: Language,
+    model: &SettingsModel,
+    selected: Option<usize>,
+) -> Result<(), String> {
+    let control = control(hwnd, ID_BINDING_LIST)?;
+    unsafe {
+        SendMessageW(control, LB_RESETCONTENT, 0, 0);
+    }
+
+    for row in model.binding_rows() {
+        let item = win::to_wide_null(&binding_list_text(language, &row));
+        unsafe {
+            SendMessageW(control, LB_ADDSTRING, 0, item.as_ptr() as LPARAM);
+        }
+    }
+
+    set_list_selection(hwnd, selected)
+}
+
+fn populate_binding_editor(hwnd: HWND) -> Result<(), String> {
+    let (model, selected) = current_bindings_view()?;
+    let language = model.language;
+    let row = selected
+        .and_then(|index| model.binding_rows().get(index).cloned())
+        .unwrap_or_else(|| KeyBindingRow::new("", KeyBindingActionKind::BuiltIn, ""));
+
+    set_control_text(hwnd, ID_BINDING_SOURCE, &row.source)?;
+    populate_binding_action_kind(hwnd, language, row.action_kind)?;
+    set_control_text(hwnd, ID_BINDING_ACTION_VALUE, &row.action_value)?;
+    Ok(())
+}
+
+fn populate_binding_action_kind(
+    hwnd: HWND,
+    language: Language,
+    selected: KeyBindingActionKind,
+) -> Result<(), String> {
+    let items = [
+        binding_action_kind_text(language, KeyBindingActionKind::BuiltIn),
+        binding_action_kind_text(language, KeyBindingActionKind::KeyTap),
+        binding_action_kind_text(language, KeyBindingActionKind::KeyCombo),
+    ];
+    populate_combo(hwnd, ID_BINDING_ACTION_KIND, &items, selected.combo_index())
+}
+
+fn binding_list_text(language: Language, row: &KeyBindingRow) -> String {
+    format!(
+        "{} | {} | {}",
+        row.source,
+        binding_action_kind_text(language, row.action_kind),
+        row.action_value
+    )
+}
+
+fn binding_action_kind_text(language: Language, kind: KeyBindingActionKind) -> &'static str {
+    match kind {
+        KeyBindingActionKind::BuiltIn => i18n::text(language, "settings.binding.type.builtin"),
+        KeyBindingActionKind::KeyTap => i18n::text(language, "settings.binding.type.key_tap"),
+        KeyBindingActionKind::KeyCombo => i18n::text(language, "settings.binding.type.key_combo"),
+    }
+}
+
+fn selected_binding_index(hwnd: HWND) -> Result<Option<usize>, String> {
+    let control = control(hwnd, ID_BINDING_LIST)?;
+    let selected = unsafe { SendMessageW(control, LB_GETCURSEL, 0, 0) };
+    if selected == LB_ERR {
+        Ok(None)
+    } else {
+        Ok(Some(selected as usize))
+    }
+}
+
+fn set_list_selection(hwnd: HWND, selected: Option<usize>) -> Result<(), String> {
+    let control = control(hwnd, ID_BINDING_LIST)?;
+    let index = selected.map(|index| index as WPARAM).unwrap_or(usize::MAX);
+    unsafe {
+        SendMessageW(control, LB_SETCURSEL, index, 0);
+    }
+    Ok(())
+}
+
+fn state_language() -> Language {
+    with_state(|state| state.model.language).unwrap_or_else(|_| app::current_language())
+}
 fn collect_model(hwnd: HWND) -> Result<SettingsModel, String> {
+    commit_current_binding_editor(hwnd)?;
     let mut model = with_state(|state| state.model.clone())?;
     model.enabled = checkbox_checked(hwnd, ID_ENABLED)?;
     model.start_with_windows = checkbox_checked(hwnd, ID_START_WITH_WINDOWS)?;
@@ -366,6 +878,11 @@ fn collect_model(hwnd: HWND) -> Result<SettingsModel, String> {
         2 => Language::EnUs,
         _ => model.language,
     };
+    if let Ok(mut state) = state_holder().lock() {
+        if let Some(state) = state.as_mut() {
+            state.model = model.clone();
+        }
+    }
     Ok(model)
 }
 
@@ -511,6 +1028,54 @@ fn create_readonly_edit(
     )
 }
 
+fn create_text_edit(
+    hwnd: HWND,
+    id: i32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<(), String> {
+    create_control(
+        hwnd,
+        "EDIT",
+        "",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32,
+        id,
+        x,
+        y,
+        width,
+        height,
+    )
+}
+
+fn create_listbox(
+    hwnd: HWND,
+    id: i32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<(), String> {
+    create_control(
+        hwnd,
+        "LISTBOX",
+        "",
+        WS_CHILD
+            | WS_VISIBLE
+            | WS_TABSTOP
+            | WS_BORDER
+            | WS_VSCROLL
+            | LBS_NOTIFY
+            | LBS_NOINTEGRALHEIGHT,
+        id,
+        x,
+        y,
+        width,
+        height,
+    )
+}
+
 fn create_combo(
     hwnd: HWND,
     id: i32,
@@ -604,6 +1169,14 @@ fn set_control_text(hwnd: HWND, id: i32, text: &str) -> Result<(), String> {
     let control = control(hwnd, id)?;
     set_window_text(control, text);
     Ok(())
+}
+
+fn control_text(hwnd: HWND, id: i32) -> Result<String, String> {
+    let control = control(hwnd, id)?;
+    let length = unsafe { GetWindowTextLengthW(control) };
+    let mut buffer = vec![0u16; length as usize + 1];
+    let copied = unsafe { GetWindowTextW(control, buffer.as_mut_ptr(), buffer.len() as i32) };
+    Ok(String::from_utf16_lossy(&buffer[..copied as usize]))
 }
 
 fn control(hwnd: HWND, id: i32) -> Result<HWND, String> {
@@ -702,5 +1275,72 @@ mod tests {
         assert_eq!(config.general.tap_capslock, TapCapsLock::Escape);
         assert_eq!(config.ui.language, Language::ZhCn);
         assert_eq!(config.capslock_layer, original_mappings);
+    }
+
+    #[test]
+    fn settings_model_adds_updates_and_deletes_binding_rows() {
+        let mut model = SettingsModel::from_config(&Config::default());
+        let original_len = model.capslock_layer.len();
+
+        model
+            .add_binding_row(KeyBindingRow::new(
+                "caps_r",
+                KeyBindingActionKind::KeyTap,
+                "f5",
+            ))
+            .unwrap();
+
+        assert_eq!(model.capslock_layer.len(), original_len + 1);
+        assert_eq!(
+            model.binding_rows().last().unwrap(),
+            &KeyBindingRow::new("caps_r", KeyBindingActionKind::KeyTap, "f5")
+        );
+
+        let index = model.capslock_layer.len() - 1;
+        model
+            .update_binding_row(
+                index,
+                KeyBindingRow::new(
+                    "caps_lalt_shift_j",
+                    KeyBindingActionKind::KeyCombo,
+                    "ctrl_c",
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            model.binding_rows().get(index).unwrap(),
+            &KeyBindingRow::new(
+                "caps_lalt_shift_j",
+                KeyBindingActionKind::KeyCombo,
+                "ctrl_c"
+            )
+        );
+
+        model.delete_binding_row(index).unwrap();
+        assert_eq!(model.capslock_layer.len(), original_len);
+    }
+
+    #[test]
+    fn settings_model_binding_rows_round_trip_through_config_ini() {
+        let mut model = SettingsModel::from_config(&Config::default());
+        let rows = vec![
+            KeyBindingRow::new("caps_h", KeyBindingActionKind::BuiltIn, "moveLeft"),
+            KeyBindingRow::new("caps_r", KeyBindingActionKind::KeyTap, "f5"),
+            KeyBindingRow::new("caps_c", KeyBindingActionKind::KeyCombo, "ctrl_c"),
+        ];
+
+        model.replace_binding_rows(rows.clone()).unwrap();
+
+        let mut config = Config::default();
+        model.apply_to_config(&mut config);
+        let ini = config.to_ini_string();
+        let reparsed = Config::from_ini(&ini).unwrap();
+        let reparsed_model = SettingsModel::from_config(&reparsed);
+
+        assert!(ini.contains("caps_h=keyFunc_moveLeft"));
+        assert!(ini.contains("caps_r=keyTarget_f5"));
+        assert!(ini.contains("caps_c=keyCombo_ctrl_c"));
+        assert_eq!(reparsed_model.binding_rows(), rows);
     }
 }

@@ -849,6 +849,9 @@ fn parse_capslock_plus_keys_section(
                 return None;
             }
             current_section = line[1..line.len() - 1].trim().to_ascii_lowercase();
+            if current_section == "keys" {
+                found_keys_section = true;
+            }
             continue;
         }
 
@@ -856,7 +859,6 @@ fn parse_capslock_plus_keys_section(
             continue;
         }
 
-        found_keys_section = true;
         let Some((key, value)) = line.split_once('=') else {
             validation.error(
                 ConfigIssueKind::Syntax,
@@ -1413,6 +1415,12 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_empty_keys_section_as_empty_layer() {
+        let config = Config::from_ini("[Keys]\n").unwrap();
+
+        assert!(config.capslock_layer.is_empty());
+    }
     #[test]
     fn parses_ui_language_values() {
         let zh_cn = Config::from_ini(
