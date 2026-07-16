@@ -363,7 +363,7 @@ impl Default for Config {
             ],
             ui: UiConfig {
                 settings_backend: "ini".to_string(),
-                settings_page: "future".to_string(),
+                settings_page: "native".to_string(),
                 language: Language::System,
             },
         }

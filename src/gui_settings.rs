@@ -107,6 +107,7 @@ const ID_BINDING_ACTION_KIND_LABEL: i32 = 3022;
 const ID_BINDING_ACTION_KIND: i32 = 3023;
 const ID_BINDING_ACTION_VALUE_LABEL: i32 = 3024;
 const ID_BINDING_ACTION_VALUE: i32 = 3025;
+const ID_BINDING_ADD: i32 = 3026;
 const ID_BINDING_UPDATE: i32 = 3027;
 const ID_BINDING_DELETE: i32 = 3028;
 const ID_BINDING_SOURCE_PREFIX: i32 = 3029;
@@ -847,6 +848,7 @@ fn handle_command(hwnd: HWND, command: i32, notification: u16) {
         ID_BINDING_ACTION_MODIFIER_ADD => add_modifier_to_editor(hwnd, &ACTION_MODIFIER_IDS),
         ID_BINDING_SOURCE_CAPTURE => toggle_key_capture(hwnd, KeyCaptureMode::Source),
         ID_BINDING_ACTION_CAPTURE => toggle_key_capture(hwnd, KeyCaptureMode::Target),
+        ID_BINDING_ADD => add_default_binding_from_list(hwnd),
         id if is_modifier_combo(id) && notification == CBN_SELCHANGE => {
             normalize_modifier_editor(hwnd, id)
         }
@@ -1339,8 +1341,9 @@ fn create_controls(hwnd: HWND) -> Result<(), String> {
     create_combo(hwnd, ID_BINDING_ACTION_VALUE, 500, 528, 210, 260)?;
     create_button(hwnd, ID_BINDING_ACTION_CAPTURE, 720, 528, 110, 26)?;
 
-    create_button(hwnd, ID_BINDING_UPDATE, 500, 632, 88, 28)?;
-    create_button(hwnd, ID_BINDING_DELETE, 604, 632, 88, 28)?;
+    create_button(hwnd, ID_BINDING_ADD, 500, 632, 88, 28)?;
+    create_button(hwnd, ID_BINDING_UPDATE, 604, 632, 88, 28)?;
+    create_button(hwnd, ID_BINDING_DELETE, 708, 632, 88, 28)?;
 
     create_static(hwnd, ID_STATUS, 18, 690, 500, 24)?;
     create_button(hwnd, ID_SAVE, 632, 688, 88, 28)?;
@@ -1436,6 +1439,11 @@ fn refresh_window(hwnd: HWND, status_key: Option<&str>) -> Result<(), String> {
         hwnd,
         ID_BINDING_ACTION_CAPTURE,
         i18n::text(language, "settings.binding.listen_target"),
+    )?;
+    set_control_text(
+        hwnd,
+        ID_BINDING_ADD,
+        i18n::text(language, "settings.binding.add"),
     )?;
     set_control_text(
         hwnd,
@@ -2384,6 +2392,68 @@ mod tests {
         assert_eq!(reparsed_model.binding_rows(), rows);
     }
 
+    #[test]
+    fn gui_save_keeps_recognized_manual_ini_fields_and_mappings() {
+        let mut config = Config::from_ini(
+            r#"
+            [general]
+            enabled = false
+            start_with_windows = true
+            run_as_admin = false
+            show_tray_icon = false
+            tap_capslock = escape
+
+            [Keys]
+            caps_h=keyFunc_moveLeft
+            caps_r=keyTarget_f5
+            caps_c=keyCombo_ctrl_c
+
+            [ui]
+            language = zh-CN
+            settings_backend = IniBackendWithCASE
+            settings_page = ManualPageWithCASE
+            "#,
+        )
+        .unwrap();
+
+        let mut model = SettingsModel::from_config(&config);
+        model.enabled = true;
+        model
+            .add_binding_row(KeyBindingRow::new(
+                "caps_lalt_d",
+                KeyBindingActionKind::BuiltIn,
+                "moveWordRight",
+            ))
+            .unwrap();
+        model.apply_to_config(&mut config);
+
+        let saved = config.to_ini_string();
+        let reparsed = Config::from_ini(&saved).unwrap();
+        let reparsed_model = SettingsModel::from_config(&reparsed);
+
+        assert!(reparsed.general.enabled);
+        assert!(reparsed.general.start_with_windows);
+        assert!(!reparsed.general.run_as_admin);
+        assert!(!reparsed.general.show_tray_icon);
+        assert_eq!(reparsed.general.tap_capslock, TapCapsLock::Escape);
+        assert_eq!(reparsed.ui.language, Language::ZhCn);
+        assert_eq!(reparsed.ui.settings_backend, "IniBackendWithCASE");
+        assert_eq!(reparsed.ui.settings_page, "ManualPageWithCASE");
+
+        let rows = reparsed_model.binding_rows();
+        for expected in [
+            KeyBindingRow::new("caps_h", KeyBindingActionKind::BuiltIn, "moveLeft"),
+            KeyBindingRow::new("caps_r", KeyBindingActionKind::KeyTap, "f5"),
+            KeyBindingRow::new("caps_c", KeyBindingActionKind::KeyCombo, "ctrl_c"),
+            KeyBindingRow::new(
+                "caps_lalt_d",
+                KeyBindingActionKind::BuiltIn,
+                "moveWordRight",
+            ),
+        ] {
+            assert!(rows.contains(&expected), "missing row: {expected:?}");
+        }
+    }
     #[test]
     fn combo_dropdown_parts_build_normalized_binding_values() {
         let source_modifiers = vec![String::new()];
