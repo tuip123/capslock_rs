@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="CapsLock RS icon">
+  <defs>
+    <linearGradient id="base" x1="188" y1="140" x2="836" y2="884" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2d3546"/>
+      <stop offset="0.58" stop-color="#171c26"/>
+      <stop offset="1" stop-color="#0c1018"/>
+    </linearGradient>
+    <linearGradient id="face" x1="270" y1="252" x2="754" y2="752" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#303a4d"/>
+      <stop offset="1" stop-color="#161b25"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="326" y1="334" x2="724" y2="734" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#85f4ff"/>
+      <stop offset="1" stop-color="#17a7d6"/>
+    </linearGradient>
+  </defs>
+  <rect x="96" y="96" width="832" height="832" rx="218" fill="url(#base)"/>
+  <path d="M210 556c0-178 148-322 330-322h80c112 0 204 88 204 196v158c0 112-92 202-206 202H408c-110 0-198-86-198-192v-42z" fill="#0b0f16" opacity=".38"/>
+  <rect x="216" y="184" width="592" height="592" rx="156" fill="url(#face)" stroke="#59657a" stroke-width="18"/>
+  <path d="M340 336h344c56 0 102 46 102 102v178c0 54-44 98-98 98H336c-54 0-98-44-98-98V438c0-56 46-102 102-102z" fill="#111722" stroke="#455165" stroke-width="18"/>
+  <path d="M426 468v-48c0-54 39-96 86-96s86 42 86 96v48" fill="none" stroke="url(#cyan)" stroke-width="56" stroke-linecap="round"/>
+  <rect x="374" y="458" width="276" height="204" rx="56" fill="url(#cyan)"/>
+  <circle cx="512" cy="544" r="30" fill="#102433"/>
+  <path d="M512 568v50" stroke="#102433" stroke-width="34" stroke-linecap="round"/>
+  <path d="M706 346l62 62-62 62" fill="none" stroke="#ffbf5a" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M318 346l-62 62 62 62" fill="none" stroke="#ffbf5a" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M512 742v-74" stroke="#ffbf5a" stroke-width="44" stroke-linecap="round"/>
+  <path d="M466 704l46 48 46-48" fill="none" stroke="#ffbf5a" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

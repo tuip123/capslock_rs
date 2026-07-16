@@ -8,14 +8,17 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    TrackPopupMenu, TranslateMessage, HMENU, IDI_APPLICATION, MF_CHECKED, MF_SEPARATOR, MF_STRING,
-    MSG, TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
+    GetCursorPos, GetMessageW, GetSystemMetrics, LoadIconW, LoadImageW, PostQuitMessage,
+    RegisterClassW, SetForegroundWindow, TrackPopupMenu, TranslateMessage, HICON, HMENU,
+    IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MF_CHECKED, MF_SEPARATOR, MF_STRING,
+    MSG, SM_CXSMICON, SM_CYSMICON, TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP,
+    WM_RBUTTONUP, WNDCLASSW,
 };
 
 use crate::{app, i18n, logging, win};
 
 const CLASS_NAME: &str = "CapsLockRSMessageWindow";
+const APP_ICON_RESOURCE_ID: usize = 1;
 const WM_TRAYICON: u32 = WM_APP + 1;
 
 const MENU_TOGGLE_ENABLED: usize = 1001;
@@ -81,7 +84,7 @@ impl TrayIcon {
         nid.uID = 1;
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAYICON;
-        nid.hIcon = unsafe { LoadIconW(null_mut(), IDI_APPLICATION) };
+        nid.hIcon = load_tray_icon();
         copy_tip(&mut nid.szTip, "CapsLock RS");
 
         let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &mut nid) };
@@ -246,6 +249,29 @@ fn handle_menu_command(command: usize) {
         MENU_EXIT => unsafe { PostQuitMessage(0) },
         _ => {}
     }
+}
+
+fn load_tray_icon() -> HICON {
+    let icon = unsafe {
+        LoadImageW(
+            win::module_handle(),
+            icon_resource(APP_ICON_RESOURCE_ID),
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_DEFAULTCOLOR | LR_SHARED,
+        ) as HICON
+    };
+
+    if icon.is_null() {
+        unsafe { LoadIconW(null_mut(), IDI_APPLICATION) }
+    } else {
+        icon
+    }
+}
+
+fn icon_resource(id: usize) -> *const u16 {
+    id as *const u16
 }
 
 fn append_menu(menu: HMENU, flags: u32, id: usize, text: &str) {
