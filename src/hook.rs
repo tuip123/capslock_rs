@@ -2,20 +2,48 @@ use std::collections::BTreeSet;
 use std::ptr::null_mut;
 use std::sync::mpsc::Sender;
 
-use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
-    WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
+    LLKHF_INJECTED, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 use crate::actions::{Action, SYNTHETIC_EXTRA_INFO};
 use crate::app::APP_CONTEXT;
 use crate::config::{Config, LayerAction, TapCapsLock};
-use crate::keys::{modifier_from_vk, KeyCombo, KeyModifier, ModifierFamily, VK_CAPITAL};
+use crate::keys::{
+    capture_modifier_from_vk, key_code_from_vk, modifier_from_vk, KeyCombo, KeyModifier,
+    ModifierFamily, VK_CAPITAL,
+};
 use crate::logging;
 
 pub struct KeyboardHook {
     handle: HHOOK,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyCaptureMode {
+    Source,
+    Target,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KeyCaptureOutcome {
+    Captured {
+        mode: KeyCaptureMode,
+        combo: KeyCombo,
+    },
+    Rejected {
+        mode: KeyCaptureMode,
+        reason: KeyCaptureRejectReason,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KeyCaptureRejectReason {
+    MissingCapsLock,
+    UnsupportedKey(u32),
+    InvalidCombo(String),
 }
 
 pub struct HookState {
@@ -27,6 +55,9 @@ pub struct HookState {
     active_modifiers: BTreeSet<KeyModifier>,
     suppressed_modifiers: BTreeSet<KeyModifier>,
     suppressed_keys: BTreeSet<u32>,
+    capture_suppressed_keys: BTreeSet<u32>,
+    key_capture: Option<KeyCaptureState>,
+    key_capture_result: Option<KeyCaptureOutcome>,
     action_sender: Sender<Action>,
 }
 
@@ -36,11 +67,87 @@ struct HookMapping {
     action: LayerAction,
 }
 
+#[derive(Clone, Debug)]
+struct KeyCaptureState {
+    mode: KeyCaptureMode,
+    hwnd: isize,
+    message_id: u32,
+    caps_down: bool,
+    active_modifiers: BTreeSet<KeyModifier>,
+}
+
 #[derive(Clone, Copy)]
 struct KeyEvent {
     vk: u32,
     is_down: bool,
     is_up: bool,
+}
+
+impl KeyCaptureMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            KeyCaptureMode::Source => "source",
+            KeyCaptureMode::Target => "target",
+        }
+    }
+}
+
+impl KeyCaptureState {
+    fn new(hwnd: isize, mode: KeyCaptureMode, message_id: u32) -> Self {
+        Self {
+            mode,
+            hwnd,
+            message_id,
+            caps_down: false,
+            active_modifiers: BTreeSet::new(),
+        }
+    }
+
+    fn handle_event(&mut self, event: KeyEvent) -> Option<KeyCaptureOutcome> {
+        if event.vk == VK_CAPITAL as u32 {
+            self.caps_down = event.is_down || (self.caps_down && !event.is_up);
+            return None;
+        }
+
+        if let Some(modifier) = capture_modifier_from_vk(event.vk as u16) {
+            if event.is_down {
+                self.active_modifiers.insert(modifier);
+            } else if event.is_up {
+                remove_modifier(&mut self.active_modifiers, modifier);
+            }
+            return None;
+        }
+
+        if !event.is_down {
+            return None;
+        }
+
+        if self.mode == KeyCaptureMode::Source && !self.caps_down {
+            return Some(KeyCaptureOutcome::Rejected {
+                mode: self.mode,
+                reason: KeyCaptureRejectReason::MissingCapsLock,
+            });
+        }
+
+        let Some(key) = key_code_from_vk(event.vk as u16) else {
+            return Some(KeyCaptureOutcome::Rejected {
+                mode: self.mode,
+                reason: KeyCaptureRejectReason::UnsupportedKey(event.vk),
+            });
+        };
+
+        let modifiers = self.active_modifiers.iter().copied().collect();
+        Some(match KeyCombo::new(modifiers, key) {
+            Ok(combo) => KeyCaptureOutcome::Captured {
+                mode: self.mode,
+                combo,
+            },
+            Err(error) => KeyCaptureOutcome::Rejected {
+                mode: self.mode,
+                reason: KeyCaptureRejectReason::InvalidCombo(error),
+            },
+        })
+    }
 }
 
 impl KeyboardHook {
@@ -76,6 +183,9 @@ impl HookState {
             active_modifiers: BTreeSet::new(),
             suppressed_modifiers: BTreeSet::new(),
             suppressed_keys: BTreeSet::new(),
+            capture_suppressed_keys: BTreeSet::new(),
+            key_capture: None,
+            key_capture_result: None,
             action_sender,
         }
     }
@@ -96,6 +206,26 @@ impl HookState {
         self.reset_transient_state();
     }
 
+    pub fn begin_key_capture(&mut self, hwnd: isize, mode: KeyCaptureMode, message_id: u32) {
+        self.reset_transient_state();
+        self.key_capture = Some(KeyCaptureState::new(hwnd, mode, message_id));
+        self.key_capture_result = None;
+        logging::log_line(format!("key capture started mode={}", mode.as_str()));
+    }
+
+    pub fn cancel_key_capture(&mut self) {
+        if let Some(capture) = self.key_capture.take() {
+            logging::log_line(format!(
+                "key capture cancelled mode={}",
+                capture.mode.as_str()
+            ));
+        }
+    }
+
+    pub fn take_key_capture_result(&mut self) -> Option<KeyCaptureOutcome> {
+        self.key_capture_result.take()
+    }
+
     fn reset_transient_state(&mut self) {
         self.caps_down = false;
         self.caps_used = false;
@@ -105,6 +235,14 @@ impl HookState {
     }
 
     fn handle_event(&mut self, event: KeyEvent) -> bool {
+        if self.key_capture.is_some() {
+            return self.handle_key_capture_event(event);
+        }
+
+        if event.is_up && self.capture_suppressed_keys.remove(&event.vk) {
+            return true;
+        }
+
         if !self.enabled {
             return false;
         }
@@ -135,6 +273,42 @@ impl HookState {
         }
 
         false
+    }
+
+    fn handle_key_capture_event(&mut self, event: KeyEvent) -> bool {
+        if event.is_down {
+            self.capture_suppressed_keys.insert(event.vk);
+        } else if event.is_up {
+            self.capture_suppressed_keys.remove(&event.vk);
+        }
+
+        let outcome = self
+            .key_capture
+            .as_mut()
+            .and_then(|capture| capture.handle_event(event));
+        if let Some(outcome) = outcome {
+            self.finish_key_capture(outcome);
+        }
+
+        // Capture mode owns the keystroke so recording never triggers a real shortcut.
+        true
+    }
+
+    fn finish_key_capture(&mut self, outcome: KeyCaptureOutcome) {
+        let target = self
+            .key_capture
+            .as_ref()
+            .map(|capture| (capture.hwnd, capture.message_id));
+        self.key_capture = None;
+        self.key_capture_result = Some(outcome);
+
+        if let Some((hwnd, message_id)) = target {
+            if hwnd != 0 && message_id != 0 {
+                unsafe {
+                    PostMessageW(hwnd as HWND, message_id, 0, 0);
+                }
+            }
+        }
     }
 
     fn handle_modifier(&mut self, event: KeyEvent, modifier: KeyModifier) -> bool {
@@ -300,7 +474,9 @@ mod tests {
     use std::sync::mpsc;
 
     use crate::config::{BuiltInAction, LayerAction};
-    use crate::keys::{parse_combo_suffix, VK_LCONTROL, VK_LMENU, VK_RMENU};
+    use crate::keys::{
+        parse_combo_suffix, VK_CONTROL, VK_F1, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_RMENU, VK_SHIFT,
+    };
 
     #[test]
     fn matches_normalized_multi_modifier_mapping() {
@@ -373,6 +549,83 @@ mod tests {
         assert!(active.is_empty());
         assert!(!remove_modifier(&mut active, KeyModifier::RAlt));
         assert_eq!(modifier_from_vk(VK_RMENU), Some(KeyModifier::RAlt));
+    }
+
+    #[test]
+    fn source_capture_records_capslock_combo_with_standard_name() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut state = HookState::from_config(&Config::default(), sender);
+
+        state.begin_key_capture(0, KeyCaptureMode::Source, 0);
+        assert!(state.handle_event(down(VK_CAPITAL as u32)));
+        assert!(state.handle_event(down(VK_LMENU as u32)));
+        assert!(state.handle_event(down(VK_SHIFT as u32)));
+        assert!(state.handle_event(down(b'J' as u32)));
+
+        let Some(KeyCaptureOutcome::Captured { mode, combo }) = state.take_key_capture_result()
+        else {
+            panic!("source capture should finish with a combo");
+        };
+        assert_eq!(mode, KeyCaptureMode::Source);
+        assert_eq!(combo.capslock_ini_key(), "caps_lalt_shift_j");
+    }
+
+    #[test]
+    fn target_capture_records_combo_with_standard_ini_value() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut state = HookState::from_config(&Config::default(), sender);
+
+        state.begin_key_capture(0, KeyCaptureMode::Target, 0);
+        assert!(state.handle_event(down(VK_CONTROL as u32)));
+        assert!(state.handle_event(down(VK_SHIFT as u32)));
+        assert!(state.handle_event(down(VK_LEFT as u32)));
+
+        let Some(KeyCaptureOutcome::Captured { mode, combo }) = state.take_key_capture_result()
+        else {
+            panic!("target capture should finish with a combo");
+        };
+        assert_eq!(mode, KeyCaptureMode::Target);
+        assert_eq!(
+            LayerAction::KeyCombo(combo).as_ini_value(),
+            "keyCombo_ctrl_shift_left"
+        );
+    }
+
+    #[test]
+    fn target_capture_records_single_key_as_key_target() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut state = HookState::from_config(&Config::default(), sender);
+
+        state.begin_key_capture(0, KeyCaptureMode::Target, 0);
+        assert!(state.handle_event(down((VK_F1 + 4) as u32)));
+
+        let Some(KeyCaptureOutcome::Captured { mode, combo }) = state.take_key_capture_result()
+        else {
+            panic!("target capture should finish with a key");
+        };
+        assert_eq!(mode, KeyCaptureMode::Target);
+        assert!(combo.modifiers.is_empty());
+        assert_eq!(
+            LayerAction::KeyTap(combo.key).as_ini_value(),
+            "keyTarget_f5"
+        );
+    }
+
+    #[test]
+    fn source_capture_rejects_combo_without_capslock() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut state = HookState::from_config(&Config::default(), sender);
+
+        state.begin_key_capture(0, KeyCaptureMode::Source, 0);
+        assert!(state.handle_event(down(b'H' as u32)));
+
+        assert_eq!(
+            state.take_key_capture_result(),
+            Some(KeyCaptureOutcome::Rejected {
+                mode: KeyCaptureMode::Source,
+                reason: KeyCaptureRejectReason::MissingCapsLock,
+            })
+        );
     }
 
     fn down(vk: u32) -> KeyEvent {

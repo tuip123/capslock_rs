@@ -243,6 +243,10 @@ pub fn parse_key_code(value: &str) -> Option<KeyCode> {
         .find(|key| key.name == key_name.as_str())
 }
 
+pub fn key_code_from_vk(vk: u16) -> Option<KeyCode> {
+    KEY_CODES.iter().copied().find(|key| key.vk == vk)
+}
+
 pub fn parse_modifier_token(value: &str) -> Option<KeyModifier> {
     match normalize_token(value).as_str() {
         "ctrl" | "control" => Some(KeyModifier::Ctrl),
@@ -257,6 +261,18 @@ pub fn parse_modifier_token(value: &str) -> Option<KeyModifier> {
         "win" | "super" | "meta" => Some(KeyModifier::Win),
         "lwin" | "leftwin" | "leftsuper" | "leftmeta" => Some(KeyModifier::LWin),
         "rwin" | "rightwin" | "rightsuper" | "rightmeta" => Some(KeyModifier::RWin),
+        _ => None,
+    }
+}
+
+pub fn capture_modifier_from_vk(vk: u16) -> Option<KeyModifier> {
+    match vk {
+        VK_CONTROL | VK_LCONTROL | VK_RCONTROL => Some(KeyModifier::Ctrl),
+        VK_SHIFT | VK_LSHIFT | VK_RSHIFT => Some(KeyModifier::Shift),
+        VK_LMENU => Some(KeyModifier::LAlt),
+        VK_RMENU => Some(KeyModifier::RAlt),
+        VK_MENU => Some(KeyModifier::Alt),
+        VK_LWIN | VK_RWIN => Some(KeyModifier::Win),
         _ => None,
     }
 }
@@ -497,6 +513,10 @@ mod tests {
             Some(key("f5", VK_F1 + 4, KeyKind::VirtualKey))
         );
         assert_eq!(
+            key_code_from_vk(VK_F1 + 4),
+            Some(key("f5", VK_F1 + 4, KeyKind::VirtualKey))
+        );
+        assert_eq!(
             parse_key_code("leftSquareBracket"),
             Some(key(
                 "left_square_bracket",
@@ -508,5 +528,18 @@ mod tests {
             parse_key_code("numpad4"),
             Some(key("numpad4", VK_NUMPAD4, KeyKind::PhysicalKey))
         );
+    }
+
+    #[test]
+    fn capture_modifier_names_use_existing_modifier_vocabulary() {
+        assert_eq!(
+            capture_modifier_from_vk(VK_LCONTROL),
+            Some(KeyModifier::Ctrl)
+        );
+        assert_eq!(
+            capture_modifier_from_vk(VK_RSHIFT),
+            Some(KeyModifier::Shift)
+        );
+        assert_eq!(capture_modifier_from_vk(VK_LMENU), Some(KeyModifier::LAlt));
     }
 }

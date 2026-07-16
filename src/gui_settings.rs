@@ -9,11 +9,11 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT, HBRUSH};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetDlgItem, GetWindowTextLengthW,
-    GetWindowTextW, IsWindow, LoadCursorW, MoveWindow, RegisterClassW, SendMessageW,
-    SetForegroundWindow, SetWindowTextW, ShowWindow, BS_AUTOCHECKBOX, BS_PUSHBUTTON,
+    GetWindowTextW, IsWindow, KillTimer, LoadCursorW, MoveWindow, RegisterClassW, SendMessageW,
+    SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow, BS_AUTOCHECKBOX, BS_PUSHBUTTON,
     CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, CW_USEDEFAULT,
-    ES_AUTOHSCROLL, ES_READONLY, HMENU, IDC_ARROW, SW_HIDE, SW_SHOW, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX,
+    ES_AUTOHSCROLL, ES_READONLY, HMENU, IDC_ARROW, SW_HIDE, SW_SHOW, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX,
     WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
@@ -21,6 +21,7 @@ use crate::config::{
     Config, ConfigIssue, ConfigIssueKind, ConfigIssueSeverity, ConfigValidation, KeyMapping,
     Language, LayerAction, TapCapsLock,
 };
+use crate::hook::{KeyCaptureMode, KeyCaptureOutcome, KeyCaptureRejectReason};
 use crate::keys::{parse_capslock_combo_name, parse_combo_suffix, KeyCombo};
 use crate::{app, i18n, logging, win};
 
@@ -74,6 +75,7 @@ struct SettingsWindowState {
     config_path: PathBuf,
     log_path: PathBuf,
     selected_binding_index: Option<usize>,
+    active_capture: Option<KeyCaptureMode>,
 }
 
 const CLASS_NAME: &str = "CapsLockRSSettingsWindow";
@@ -120,6 +122,8 @@ const ID_BINDING_SOURCE_MODIFIER_ADD: i32 = 3038;
 const ID_BINDING_ACTION_MODIFIER_ADD: i32 = 3039;
 const ID_BINDING_ACTION_COUNT_LABEL: i32 = 3040;
 const ID_BINDING_ACTION_COUNT: i32 = 3041;
+const ID_BINDING_SOURCE_CAPTURE: i32 = 3042;
+const ID_BINDING_ACTION_CAPTURE: i32 = 3043;
 
 const BM_GETCHECK: u32 = 0x00F0;
 const BM_SETCHECK: u32 = 0x00F1;
@@ -137,6 +141,9 @@ const LB_ERR: isize = -1;
 const LBN_SELCHANGE: u16 = 1;
 const CBN_SELCHANGE: u16 = 1;
 const WS_VSCROLL: u32 = 0x00200000;
+const KEY_CAPTURE_TIMER_ID: usize = 1;
+const KEY_CAPTURE_TIMEOUT_MS: u32 = 10_000;
+const WM_KEY_CAPTURE_DONE: u32 = WM_APP + 2;
 const NO_MODIFIER_CHOICE: &str = "-";
 const SOURCE_MODIFIER_IDS: [i32; 4] = [
     ID_BINDING_SOURCE_MODIFIER_1,
@@ -150,6 +157,12 @@ const ACTION_MODIFIER_IDS: [i32; 4] = [
     ID_BINDING_ACTION_MODIFIER_3,
     ID_BINDING_ACTION_MODIFIER_4,
 ];
+const CONTROL_HEIGHT: i32 = 26;
+const COMBO_DROPDOWN_HEIGHT: i32 = 180;
+const SOURCE_MODIFIER_POSITIONS: [(i32, i32); 4] = [(590, 336), (700, 336), (500, 366), (610, 366)];
+const ACTION_MODIFIER_POSITIONS: [(i32, i32); 4] = [(500, 528), (610, 528), (500, 558), (610, 558)];
+const ACTION_VALUE_DEFAULT_Y: i32 = 528;
+const ACTION_VALUE_COMBO_Y: i32 = 590;
 const MODIFIER_CHOICES: &[&str] = &[
     NO_MODIFIER_CHOICE,
     "ctrl",
@@ -768,6 +781,7 @@ pub fn open() -> Result<(), String> {
             config_path: snapshot.config_path,
             log_path: snapshot.log_path,
             selected_binding_index: None,
+            active_capture: None,
         });
     }
 
@@ -797,11 +811,21 @@ unsafe extern "system" fn window_proc(
             );
             0
         }
+        WM_KEY_CAPTURE_DONE => {
+            finish_key_capture(hwnd);
+            0
+        }
+        WM_TIMER if w_param == KEY_CAPTURE_TIMER_ID => {
+            timeout_key_capture(hwnd);
+            0
+        }
         WM_CLOSE => {
             DestroyWindow(hwnd);
             0
         }
         WM_DESTROY => {
+            let _ = app::cancel_key_capture();
+            KillTimer(hwnd, KEY_CAPTURE_TIMER_ID);
             clear_window_state(hwnd);
             0
         }
@@ -821,6 +845,8 @@ fn handle_command(hwnd: HWND, command: i32, notification: u16) {
         ID_BINDING_ACTION_KIND if notification == CBN_SELCHANGE => change_binding_action_kind(hwnd),
         ID_BINDING_SOURCE_MODIFIER_ADD => add_modifier_to_editor(hwnd, &SOURCE_MODIFIER_IDS),
         ID_BINDING_ACTION_MODIFIER_ADD => add_modifier_to_editor(hwnd, &ACTION_MODIFIER_IDS),
+        ID_BINDING_SOURCE_CAPTURE => toggle_key_capture(hwnd, KeyCaptureMode::Source),
+        ID_BINDING_ACTION_CAPTURE => toggle_key_capture(hwnd, KeyCaptureMode::Target),
         id if is_modifier_combo(id) && notification == CBN_SELCHANGE => {
             normalize_modifier_editor(hwnd, id)
         }
@@ -870,6 +896,7 @@ fn save_from_window(hwnd: HWND) {
                         config_path: snapshot.config_path,
                         log_path: snapshot.log_path,
                         selected_binding_index,
+                        active_capture: None,
                     });
                 }
                 let status_key = if has_warnings {
@@ -1023,10 +1050,194 @@ fn change_binding_action_kind(hwnd: HWND) {
         .and_then(KeyBindingActionKind::from_combo_index)
         .unwrap_or(KeyBindingActionKind::BuiltIn);
     let row = KeyBindingRow::new("caps_space", kind, default_action_value(kind));
-    if let Err(error) = populate_binding_action_editor(hwnd, language, &row) {
+    if let Err(error) = populate_binding_action_editor(hwnd, language, &row)
+        .and_then(|()| update_capture_controls(hwnd))
+    {
         handle_binding_error(hwnd, error);
     }
 }
+
+fn toggle_key_capture(hwnd: HWND, mode: KeyCaptureMode) {
+    let result = (|| {
+        if active_capture_mode()? == Some(mode) {
+            cancel_active_key_capture(hwnd, Some("settings.capture_cancelled"))?;
+            return Ok(());
+        }
+
+        if active_capture_mode()?.is_some() {
+            cancel_active_key_capture(hwnd, None)?;
+        }
+
+        app::begin_key_capture(hwnd, mode, WM_KEY_CAPTURE_DONE)?;
+        set_active_capture(Some(mode))?;
+        unsafe {
+            SetTimer(hwnd, KEY_CAPTURE_TIMER_ID, KEY_CAPTURE_TIMEOUT_MS, None);
+        }
+        update_capture_controls(hwnd)?;
+        set_status(hwnd, state_language(), capture_started_status_key(mode))
+    })();
+
+    if let Err(error) = result {
+        handle_binding_error(hwnd, error);
+    }
+}
+
+fn finish_key_capture(hwnd: HWND) {
+    let result = (|| {
+        unsafe {
+            KillTimer(hwnd, KEY_CAPTURE_TIMER_ID);
+        }
+        let outcome = app::take_key_capture_result()
+            .ok_or_else(|| "key capture finished without a result".to_string())?;
+        set_active_capture(None)?;
+        update_capture_controls(hwnd)?;
+
+        match outcome {
+            KeyCaptureOutcome::Captured { mode, combo } => match mode {
+                KeyCaptureMode::Source => apply_captured_source(hwnd, &combo),
+                KeyCaptureMode::Target => apply_captured_target(hwnd, &combo),
+            },
+            KeyCaptureOutcome::Rejected { mode, reason } => {
+                handle_capture_rejection(hwnd, mode, reason)
+            }
+        }
+    })();
+
+    if let Err(error) = result {
+        handle_binding_error(hwnd, error);
+    }
+}
+
+fn timeout_key_capture(hwnd: HWND) {
+    if active_capture_mode().ok().flatten().is_some() {
+        if let Err(error) = cancel_active_key_capture(hwnd, Some("settings.capture_timeout")) {
+            handle_binding_error(hwnd, error);
+        }
+    }
+}
+
+fn cancel_active_key_capture(hwnd: HWND, status_key: Option<&str>) -> Result<(), String> {
+    app::cancel_key_capture()?;
+    unsafe {
+        KillTimer(hwnd, KEY_CAPTURE_TIMER_ID);
+    }
+    set_active_capture(None)?;
+    update_capture_controls(hwnd)?;
+    if let Some(status_key) = status_key {
+        set_status(hwnd, state_language(), status_key)?;
+    }
+    Ok(())
+}
+
+fn apply_captured_source(hwnd: HWND, combo: &KeyCombo) -> Result<(), String> {
+    let parts = ComboEditorParts::from_key_combo(combo);
+    populate_modifier_combos(hwnd, &SOURCE_MODIFIER_IDS, &parts.modifiers)?;
+    refresh_modifier_editor_visibility(hwnd, &SOURCE_MODIFIER_IDS)?;
+    populate_combo_values(hwnd, ID_BINDING_SOURCE, KEY_CHOICES, &parts.key)?;
+    set_status(hwnd, state_language(), "settings.capture_source_saved")
+}
+
+fn apply_captured_target(hwnd: HWND, combo: &KeyCombo) -> Result<(), String> {
+    let language = state_language();
+    if combo.modifiers.is_empty() {
+        populate_binding_action_kind(hwnd, language, KeyBindingActionKind::KeyTap)?;
+        move_action_value_editor(hwnd, ACTION_VALUE_DEFAULT_Y)?;
+        show_combo_modifier_editor(hwnd, &ACTION_MODIFIER_IDS, false)?;
+        show_builtin_count_editor(hwnd, false)?;
+        populate_combo_values(hwnd, ID_BINDING_ACTION_VALUE, KEY_CHOICES, combo.key.name)?;
+    } else {
+        populate_binding_action_kind(hwnd, language, KeyBindingActionKind::KeyCombo)?;
+        move_action_value_editor(hwnd, ACTION_VALUE_COMBO_Y)?;
+        show_builtin_count_editor(hwnd, false)?;
+        let parts = ComboEditorParts::from_key_combo(combo);
+        populate_modifier_combos(hwnd, &ACTION_MODIFIER_IDS, &parts.modifiers)?;
+        refresh_modifier_editor_visibility(hwnd, &ACTION_MODIFIER_IDS)?;
+        populate_combo_values(hwnd, ID_BINDING_ACTION_VALUE, KEY_CHOICES, &parts.key)?;
+    }
+    update_capture_controls(hwnd)?;
+    set_status(hwnd, language, "settings.capture_target_saved")
+}
+
+fn handle_capture_rejection(
+    hwnd: HWND,
+    mode: KeyCaptureMode,
+    reason: KeyCaptureRejectReason,
+) -> Result<(), String> {
+    let status_key = match reason {
+        KeyCaptureRejectReason::MissingCapsLock => "settings.capture_missing_caps",
+        KeyCaptureRejectReason::UnsupportedKey(vk) => {
+            logging::log_line(format!(
+                "key capture rejected mode={} unsupported_vk={vk}",
+                capture_mode_name(mode)
+            ));
+            "settings.capture_unsupported_key"
+        }
+        KeyCaptureRejectReason::InvalidCombo(error) => {
+            logging::log_line(format!(
+                "key capture rejected mode={} error={error}",
+                capture_mode_name(mode)
+            ));
+            "settings.capture_invalid_combo"
+        }
+    };
+    set_status(hwnd, state_language(), status_key)
+}
+
+fn update_capture_controls(hwnd: HWND) -> Result<(), String> {
+    let language = state_language();
+    let active = active_capture_mode()?;
+    let source_text = if active == Some(KeyCaptureMode::Source) {
+        i18n::text(language, "settings.binding.listen_cancel")
+    } else {
+        i18n::text(language, "settings.binding.listen_source")
+    };
+    let target_text = if active == Some(KeyCaptureMode::Target) {
+        i18n::text(language, "settings.binding.listen_cancel")
+    } else {
+        i18n::text(language, "settings.binding.listen_target")
+    };
+    set_control_text(hwnd, ID_BINDING_SOURCE_CAPTURE, source_text)?;
+    set_control_text(hwnd, ID_BINDING_ACTION_CAPTURE, target_text)?;
+
+    let action_kind = combo_index(hwnd, ID_BINDING_ACTION_KIND)
+        .and_then(KeyBindingActionKind::from_combo_index)
+        .unwrap_or(KeyBindingActionKind::BuiltIn);
+    show_control(
+        hwnd,
+        ID_BINDING_ACTION_CAPTURE,
+        action_kind != KeyBindingActionKind::BuiltIn || active == Some(KeyCaptureMode::Target),
+    )
+}
+
+fn active_capture_mode() -> Result<Option<KeyCaptureMode>, String> {
+    with_state(|state| state.active_capture)
+}
+
+fn set_active_capture(mode: Option<KeyCaptureMode>) -> Result<(), String> {
+    let mut state = state_holder()
+        .lock()
+        .map_err(|_| "settings window lock is poisoned".to_string())?;
+    let state = state
+        .as_mut()
+        .ok_or_else(|| "settings window is not initialized".to_string())?;
+    state.active_capture = mode;
+    Ok(())
+}
+
+fn capture_started_status_key(mode: KeyCaptureMode) -> &'static str {
+    match mode {
+        KeyCaptureMode::Source => "settings.capture_source_started",
+        KeyCaptureMode::Target => "settings.capture_target_started",
+    }
+}
+
+fn capture_mode_name(mode: KeyCaptureMode) -> &'static str {
+    match mode {
+        KeyCaptureMode::Source => "source",
+        KeyCaptureMode::Target => "target",
+    }
+}
+
 fn collect_binding_editor_row(hwnd: HWND) -> Result<KeyBindingRow, String> {
     let source_modifiers = selected_modifier_values(hwnd, &SOURCE_MODIFIER_IDS)?;
     let source_key = control_text(hwnd, ID_BINDING_SOURCE)?;
@@ -1111,7 +1322,8 @@ fn create_controls(hwnd: HWND) -> Result<(), String> {
     create_combo(hwnd, ID_BINDING_SOURCE_MODIFIER_2, 710, 336, 110, 180)?;
     create_combo(hwnd, ID_BINDING_SOURCE_MODIFIER_3, 500, 366, 110, 180)?;
     create_combo(hwnd, ID_BINDING_SOURCE_MODIFIER_4, 620, 366, 110, 180)?;
-    create_combo(hwnd, ID_BINDING_SOURCE, 500, 396, 330, 260)?;
+    create_combo(hwnd, ID_BINDING_SOURCE, 500, 396, 210, 260)?;
+    create_button(hwnd, ID_BINDING_SOURCE_CAPTURE, 720, 396, 110, 26)?;
 
     create_static(hwnd, ID_BINDING_ACTION_KIND_LABEL, 500, 438, 330, 22)?;
     create_combo(hwnd, ID_BINDING_ACTION_KIND, 500, 464, 330, 160)?;
@@ -1124,7 +1336,8 @@ fn create_controls(hwnd: HWND) -> Result<(), String> {
     create_combo(hwnd, ID_BINDING_ACTION_MODIFIER_2, 610, 566, 110, 180)?;
     create_combo(hwnd, ID_BINDING_ACTION_MODIFIER_3, 500, 596, 110, 180)?;
     create_combo(hwnd, ID_BINDING_ACTION_MODIFIER_4, 610, 596, 110, 180)?;
-    create_combo(hwnd, ID_BINDING_ACTION_VALUE, 500, 528, 330, 260)?;
+    create_combo(hwnd, ID_BINDING_ACTION_VALUE, 500, 528, 210, 260)?;
+    create_button(hwnd, ID_BINDING_ACTION_CAPTURE, 720, 528, 110, 26)?;
 
     create_button(hwnd, ID_BINDING_UPDATE, 500, 632, 88, 28)?;
     create_button(hwnd, ID_BINDING_DELETE, 604, 632, 88, 28)?;
@@ -1214,6 +1427,16 @@ fn refresh_window(hwnd: HWND, status_key: Option<&str>) -> Result<(), String> {
     )?;
     set_control_text(hwnd, ID_BINDING_SOURCE_MODIFIER_ADD, "+")?;
     set_control_text(hwnd, ID_BINDING_ACTION_MODIFIER_ADD, "+")?;
+    set_control_text(
+        hwnd,
+        ID_BINDING_SOURCE_CAPTURE,
+        i18n::text(language, "settings.binding.listen_source"),
+    )?;
+    set_control_text(
+        hwnd,
+        ID_BINDING_ACTION_CAPTURE,
+        i18n::text(language, "settings.binding.listen_target"),
+    )?;
     set_control_text(
         hwnd,
         ID_BINDING_UPDATE,
@@ -1311,6 +1534,7 @@ fn populate_binding_editor(hwnd: HWND) -> Result<(), String> {
     populate_binding_source_editor(hwnd, &row)?;
     populate_binding_action_kind(hwnd, language, row.action_kind)?;
     populate_binding_action_editor(hwnd, language, &row)?;
+    update_capture_controls(hwnd)?;
     Ok(())
 }
 
@@ -1328,6 +1552,7 @@ fn populate_binding_action_editor(
 ) -> Result<(), String> {
     match row.action_kind {
         KeyBindingActionKind::BuiltIn => {
+            move_action_value_editor(hwnd, ACTION_VALUE_DEFAULT_Y)?;
             show_combo_modifier_editor(hwnd, &ACTION_MODIFIER_IDS, false)?;
             show_builtin_count_editor(hwnd, true)?;
             let builtin = builtin_editor_value(&row.action_value);
@@ -1340,6 +1565,7 @@ fn populate_binding_action_editor(
             )
         }
         KeyBindingActionKind::KeyTap => {
+            move_action_value_editor(hwnd, ACTION_VALUE_DEFAULT_Y)?;
             show_combo_modifier_editor(hwnd, &ACTION_MODIFIER_IDS, false)?;
             show_builtin_count_editor(hwnd, false)?;
             populate_combo_values(
@@ -1350,6 +1576,7 @@ fn populate_binding_action_editor(
             )
         }
         KeyBindingActionKind::KeyCombo => {
+            move_action_value_editor(hwnd, ACTION_VALUE_COMBO_Y)?;
             show_builtin_count_editor(hwnd, false)?;
             let parts = combo_parts_from_suffix(&row.action_value);
             populate_modifier_combos(hwnd, &ACTION_MODIFIER_IDS, &parts.modifiers)?;
@@ -1420,13 +1647,15 @@ fn normalize_modifier_editor(hwnd: HWND, changed_id: i32) {
 fn refresh_modifier_editor_visibility(hwnd: HWND, ids: &[i32]) -> Result<(), String> {
     let count = selected_modifier_values(hwnd, ids)?.len();
     for (index, id) in ids.iter().enumerate() {
+        let (x, y) = modifier_position(ids, index);
+        move_control(hwnd, *id, x, y, 110, COMBO_DROPDOWN_HEIGHT)?;
         show_control(hwnd, *id, index < count)?;
     }
 
     let add_id = modifier_add_button_id(ids);
     show_control(hwnd, add_id, count < ids.len())?;
-    let (x, y) = modifier_add_button_position(ids, count);
-    move_control(hwnd, add_id, x, y, 28, 26)
+    let (x, y) = modifier_position(ids, count);
+    move_control(hwnd, add_id, x, y, 28, CONTROL_HEIGHT)
 }
 
 fn show_combo_modifier_editor(hwnd: HWND, ids: &[i32], visible: bool) -> Result<(), String> {
@@ -1460,16 +1689,27 @@ fn modifier_add_button_id(ids: &[i32]) -> i32 {
     }
 }
 
-fn modifier_add_button_position(ids: &[i32], count: usize) -> (i32, i32) {
-    let source_positions = [(590, 336), (700, 336), (500, 366), (610, 366)];
-    let action_positions = [(500, 566), (610, 566), (500, 596), (610, 596)];
+fn modifier_position(ids: &[i32], index: usize) -> (i32, i32) {
     let positions = if ids.first() == SOURCE_MODIFIER_IDS.first() {
-        &source_positions
+        &SOURCE_MODIFIER_POSITIONS
     } else {
-        &action_positions
+        &ACTION_MODIFIER_POSITIONS
     };
-    positions[count.min(positions.len() - 1)]
+    positions[index.min(positions.len() - 1)]
 }
+
+fn move_action_value_editor(hwnd: HWND, y: i32) -> Result<(), String> {
+    move_control(
+        hwnd,
+        ID_BINDING_ACTION_VALUE,
+        500,
+        y,
+        210,
+        COMBO_DROPDOWN_HEIGHT,
+    )?;
+    move_control(hwnd, ID_BINDING_ACTION_CAPTURE, 720, y, 110, CONTROL_HEIGHT)
+}
+
 fn populate_combo_values(
     hwnd: HWND,
     id: i32,
@@ -2157,6 +2397,13 @@ mod tests {
             normalized_combo_suffix_from_parts(&action_modifiers, "space").unwrap(),
             "ctrl_space"
         );
+    }
+
+    #[test]
+    fn target_combo_layout_places_modifiers_before_final_key() {
+        assert!(ACTION_MODIFIER_POSITIONS
+            .iter()
+            .all(|(_, y)| *y < ACTION_VALUE_COMBO_Y));
     }
 
     #[test]

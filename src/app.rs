@@ -8,7 +8,7 @@ use windows_sys::Win32::Foundation::HWND;
 use crate::actions;
 use crate::config::{Config, ConfigPaths, Language};
 use crate::gui_settings::SettingsModel;
-use crate::hook::{HookState, KeyboardHook};
+use crate::hook::{HookState, KeyCaptureMode, KeyCaptureOutcome, KeyboardHook};
 use crate::{gui_settings, i18n, logging, startup, tray, win};
 
 pub static APP_CONTEXT: OnceLock<AppContext> = OnceLock::new();
@@ -156,6 +156,36 @@ pub fn message_hwnd() -> Option<HWND> {
     } else {
         Some(*hwnd as HWND)
     }
+}
+
+pub fn begin_key_capture(hwnd: HWND, mode: KeyCaptureMode, message_id: u32) -> Result<(), String> {
+    let context = APP_CONTEXT
+        .get()
+        .ok_or_else(|| "app context is not initialized".to_string())?;
+    let mut hook_state = context
+        .hook_state
+        .lock()
+        .map_err(|_| "hook state lock is poisoned".to_string())?;
+    hook_state.begin_key_capture(hwnd as isize, mode, message_id);
+    Ok(())
+}
+
+pub fn cancel_key_capture() -> Result<(), String> {
+    let context = APP_CONTEXT
+        .get()
+        .ok_or_else(|| "app context is not initialized".to_string())?;
+    let mut hook_state = context
+        .hook_state
+        .lock()
+        .map_err(|_| "hook state lock is poisoned".to_string())?;
+    hook_state.cancel_key_capture();
+    Ok(())
+}
+
+pub fn take_key_capture_result() -> Option<KeyCaptureOutcome> {
+    let context = APP_CONTEXT.get()?;
+    let mut hook_state = context.hook_state.lock().ok()?;
+    hook_state.take_key_capture_result()
 }
 
 pub fn toggle_enabled() {
