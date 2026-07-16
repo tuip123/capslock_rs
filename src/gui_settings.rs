@@ -17,7 +17,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
-use crate::config::{Config, ConfigIssue, KeyMapping, Language, LayerAction, TapCapsLock};
+use crate::config::{
+    Config, ConfigIssue, ConfigIssueKind, ConfigIssueSeverity, ConfigValidation, KeyMapping,
+    Language, LayerAction, TapCapsLock,
+};
 use crate::keys::{parse_capslock_combo_name, parse_combo_suffix, KeyCombo};
 use crate::{app, i18n, logging, win};
 
@@ -30,6 +33,13 @@ pub struct SettingsModel {
     pub tap_capslock: TapCapsLock,
     pub language: Language,
     pub capslock_layer: Vec<KeyMapping>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SettingsValidationReport {
+    pub validation: ConfigValidation,
+    pub expected_mapping_count: usize,
+    pub parsed_mapping_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -287,7 +297,40 @@ impl SettingsModel {
         config.ui.language = self.language;
         config.capslock_layer = self.capslock_layer.clone();
     }
+
+    pub fn validate_for_save(&self) -> SettingsValidationReport {
+        let mut config = Config::default();
+        self.apply_to_config(&mut config);
+        validate_config_for_save(&config, self.capslock_layer.len())
+    }
 }
+
+impl SettingsValidationReport {
+    pub fn has_errors(&self) -> bool {
+        self.validation
+            .issues
+            .iter()
+            .any(settings_issue_blocks_save)
+    }
+
+    pub fn has_warnings(&self) -> bool {
+        self.validation.issues.iter().any(|issue| {
+            issue.severity == ConfigIssueSeverity::Warning && !settings_issue_blocks_save(issue)
+        })
+    }
+
+    pub fn format_for_language(&self, language: Language) -> String {
+        format_settings_validation_report(language, self)
+    }
+}
+
+pub(crate) fn validate_config_for_save(
+    config: &Config,
+    expected_mapping_count: usize,
+) -> SettingsValidationReport {
+    settings_validation_report_from_ini(&config.to_ini_string(), expected_mapping_count)
+}
+
 impl SettingsModel {
     pub fn binding_rows(&self) -> Vec<KeyBindingRow> {
         self.capslock_layer
@@ -407,18 +450,17 @@ fn parse_binding_rows(rows: &[KeyBindingRow]) -> Result<Vec<KeyMapping>, String>
         return Ok(Vec::new());
     }
 
-    let mut content = String::from("[Keys]\n");
-    for row in rows {
-        content.push_str(&row.source_ini_key()?);
-        content.push('=');
-        content.push_str(&row.action_ini_value()?);
-        content.push('\n');
-    }
+    let content = binding_rows_ini(rows)?;
 
     // Use the real config parser so GUI validation cannot drift from INI semantics.
     let parsed = Config::from_ini_with_validation(&content);
-    if !parsed.validation.issues.is_empty() {
-        return Err(format_config_issues(&parsed.validation.issues));
+    let report = settings_validation_report(
+        parsed.validation.clone(),
+        rows.len(),
+        parsed.config.capslock_layer.len(),
+    );
+    if !report.validation.issues.is_empty() {
+        return Err(report.format_for_language(Language::EnUs));
     }
     if parsed.config.capslock_layer.len() != rows.len() {
         return Err("some binding rows were ignored by the config parser".to_string());
@@ -427,15 +469,137 @@ fn parse_binding_rows(rows: &[KeyBindingRow]) -> Result<Vec<KeyMapping>, String>
     Ok(parsed.config.capslock_layer)
 }
 
-fn format_config_issues(issues: &[ConfigIssue]) -> String {
-    let messages: Vec<String> = issues
-        .iter()
-        .map(|issue| match issue.line {
-            Some(line) => format!("line {line}: {}", issue.message),
-            None => issue.message.clone(),
-        })
-        .collect();
-    messages.join("; ")
+#[cfg(test)]
+fn validate_binding_rows_for_save(
+    rows: &[KeyBindingRow],
+) -> Result<SettingsValidationReport, String> {
+    let content = binding_rows_ini(rows)?;
+    Ok(settings_validation_report_from_ini(&content, rows.len()))
+}
+
+fn binding_rows_ini(rows: &[KeyBindingRow]) -> Result<String, String> {
+    let mut content = String::from("[Keys]\n");
+    for row in rows {
+        content.push_str(&row.source_ini_key()?);
+        content.push('=');
+        content.push_str(&row.action_ini_value()?);
+        content.push('\n');
+    }
+    Ok(content)
+}
+
+fn settings_validation_report_from_ini(
+    content: &str,
+    expected_mapping_count: usize,
+) -> SettingsValidationReport {
+    let parsed = Config::from_ini_with_validation(content);
+    settings_validation_report(
+        parsed.validation,
+        expected_mapping_count,
+        parsed.config.capslock_layer.len(),
+    )
+}
+
+fn settings_validation_report(
+    mut validation: ConfigValidation,
+    expected_mapping_count: usize,
+    parsed_mapping_count: usize,
+) -> SettingsValidationReport {
+    if expected_mapping_count != parsed_mapping_count
+        && !validation.issues.iter().any(settings_issue_blocks_save)
+    {
+        validation.issues.push(ConfigIssue {
+            severity: ConfigIssueSeverity::Error,
+            kind: ConfigIssueKind::InvalidMapping,
+            line: None,
+            section: Some("keys".to_string()),
+            key: None,
+            value: None,
+            message: format!(
+                "expected {expected_mapping_count} mapping rows but parser returned {parsed_mapping_count}"
+            ),
+        });
+    }
+
+    SettingsValidationReport {
+        validation,
+        expected_mapping_count,
+        parsed_mapping_count,
+    }
+}
+
+fn settings_issue_blocks_save(issue: &ConfigIssue) -> bool {
+    issue.severity == ConfigIssueSeverity::Error
+        || matches!(
+            issue.kind,
+            ConfigIssueKind::DuplicateMapping
+                | ConfigIssueKind::InvalidMapping
+                | ConfigIssueKind::UnknownAction
+        )
+}
+
+fn format_settings_validation_report(
+    language: Language,
+    report: &SettingsValidationReport,
+) -> String {
+    let mut lines = Vec::new();
+    let header_key = if report.has_errors() {
+        "settings.validation_blocked"
+    } else {
+        "settings.validation_warnings"
+    };
+    lines.push(i18n::text(language, header_key).to_string());
+
+    for issue in &report.validation.issues {
+        lines.push(format_settings_validation_issue(language, issue));
+    }
+
+    lines.join("\n")
+}
+
+fn format_settings_validation_issue(language: Language, issue: &ConfigIssue) -> String {
+    let severity_key = if settings_issue_blocks_save(issue) {
+        "settings.validation.severity.error"
+    } else {
+        "settings.validation.severity.warning"
+    };
+    let kind_key = match issue.kind {
+        ConfigIssueKind::Syntax => "settings.validation.issue.syntax",
+        ConfigIssueKind::InvalidValue => "settings.validation.issue.invalid_value",
+        ConfigIssueKind::InvalidMapping => "settings.validation.issue.invalid_mapping",
+        ConfigIssueKind::DuplicateMapping => "settings.validation.issue.duplicate_mapping",
+        ConfigIssueKind::UnknownAction => "settings.validation.issue.unknown_action",
+    };
+
+    let mut context = Vec::new();
+    if let Some(line) = issue.line {
+        context.push(format!(
+            "{} {line}",
+            i18n::text(language, "settings.validation.line")
+        ));
+    }
+    if let Some(section) = &issue.section {
+        context.push(format!("[{section}]"));
+    }
+    match (&issue.key, &issue.value) {
+        (Some(key), Some(value)) => context.push(format!("{key}={value}")),
+        (Some(key), None) => context.push(key.clone()),
+        _ => {}
+    }
+
+    let context = if context.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", context.join(", "))
+    };
+
+    format!(
+        "- {}: {}{} - {}",
+        i18n::text(language, severity_key),
+        i18n::text(language, kind_key),
+        context,
+        issue.message
+    )
 }
 
 fn ensure_ascii_case_prefix(value: &str, prefix: &str) -> String {
@@ -680,6 +844,18 @@ fn save_from_window(hwnd: HWND) {
         }
     };
     let language = model.language;
+    let validation = model.validate_for_save();
+    if validation.has_errors() {
+        log_settings_validation_report(&validation);
+        let _ = set_status(hwnd, language, "settings.validation_blocked");
+        show_settings_validation(language, &validation);
+        return;
+    }
+
+    let has_warnings = validation.has_warnings();
+    if has_warnings {
+        log_settings_validation_report(&validation);
+    }
 
     match app::save_settings_model(&model) {
         Ok(()) => match app::settings_snapshot() {
@@ -696,7 +872,15 @@ fn save_from_window(hwnd: HWND) {
                         selected_binding_index,
                     });
                 }
-                let _ = refresh_window(hwnd, Some("settings.saved"));
+                let status_key = if has_warnings {
+                    "settings.saved_with_warnings"
+                } else {
+                    "settings.saved"
+                };
+                let _ = refresh_window(hwnd, Some(status_key));
+                if has_warnings {
+                    show_settings_validation(language, &validation);
+                }
             }
             Err(error) => {
                 logging::log_line(format!("failed to refresh settings after save: {error}"));
@@ -1761,6 +1945,56 @@ fn show_settings_error(language: Language, summary_key: &str, detail: &str) {
     );
 }
 
+fn show_settings_validation(language: Language, report: &SettingsValidationReport) {
+    win::message_box(
+        i18n::text(language, "app.title"),
+        &report.format_for_language(language),
+    );
+}
+
+fn log_settings_validation_report(report: &SettingsValidationReport) {
+    logging::log_line(format!(
+        "settings validation summary expected_mapping_count={} parsed_mapping_count={} issue_count={}",
+        report.expected_mapping_count,
+        report.parsed_mapping_count,
+        report.validation.issues.len()
+    ));
+
+    for issue in &report.validation.issues {
+        logging::log_line(format!(
+            "settings validation issue blocking={} parser_severity={} kind={} line={} section={} key={} value={} message={}",
+            settings_issue_blocks_save(issue),
+            config_issue_severity_name(issue.severity),
+            config_issue_kind_name(issue.kind),
+            issue
+                .line
+                .map(|line| line.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            issue.section.as_deref().unwrap_or("none"),
+            issue.key.as_deref().unwrap_or("none"),
+            issue.value.as_deref().unwrap_or("none"),
+            issue.message
+        ));
+    }
+}
+
+fn config_issue_severity_name(severity: ConfigIssueSeverity) -> &'static str {
+    match severity {
+        ConfigIssueSeverity::Error => "error",
+        ConfigIssueSeverity::Warning => "warning",
+    }
+}
+
+fn config_issue_kind_name(kind: ConfigIssueKind) -> &'static str {
+    match kind {
+        ConfigIssueKind::Syntax => "syntax",
+        ConfigIssueKind::InvalidValue => "invalid_value",
+        ConfigIssueKind::InvalidMapping => "invalid_mapping",
+        ConfigIssueKind::DuplicateMapping => "duplicate_mapping",
+        ConfigIssueKind::UnknownAction => "unknown_action",
+    }
+}
+
 fn active_window() -> Option<HWND> {
     let mut state = state_holder().lock().ok()?;
     let hwnd = state.as_ref()?.hwnd as HWND;
@@ -1939,9 +2173,96 @@ mod tests {
     }
 
     #[test]
+    fn binding_save_validation_reports_duplicate_and_invalid_input_combo() {
+        let rows = vec![
+            KeyBindingRow::new("caps_h", KeyBindingActionKind::BuiltIn, "moveLeft"),
+            KeyBindingRow::new("caps_h", KeyBindingActionKind::BuiltIn, "moveRight"),
+            KeyBindingRow::new("caps_lctrl_ctrl_j", KeyBindingActionKind::BuiltIn, "moveUp"),
+        ];
+
+        let report = validate_binding_rows_for_save(&rows).unwrap();
+
+        assert!(report.has_errors());
+        assert!(has_validation_issue(
+            &report,
+            ConfigIssueKind::DuplicateMapping
+        ));
+        assert!(has_validation_issue(
+            &report,
+            ConfigIssueKind::InvalidMapping
+        ));
+        assert!(report
+            .format_for_language(Language::ZhCn)
+            .contains("重复映射"));
+        assert!(report
+            .format_for_language(Language::ZhCn)
+            .contains("非法输入组合"));
+    }
+
+    #[test]
+    fn binding_save_validation_reports_unknown_actions_by_type() {
+        let rows = vec![
+            KeyBindingRow::new("caps_j", KeyBindingActionKind::BuiltIn, "noSuchAction"),
+            KeyBindingRow::new("caps_r", KeyBindingActionKind::KeyTap, "no_such_key"),
+            KeyBindingRow::new("caps_c", KeyBindingActionKind::KeyCombo, "ctrl_no_such_key"),
+            KeyBindingRow::new("caps_d", KeyBindingActionKind::BuiltIn, "moveLeft(nope)"),
+        ];
+
+        let report = validate_binding_rows_for_save(&rows).unwrap();
+        let formatted = report.format_for_language(Language::EnUs);
+
+        assert!(report.has_errors());
+        assert_eq!(
+            report
+                .validation
+                .issues
+                .iter()
+                .filter(|issue| issue.kind == ConfigIssueKind::UnknownAction)
+                .count(),
+            4
+        );
+        assert!(formatted.contains("Unknown action"));
+        assert!(formatted.contains("caps_j=keyFunc_noSuchAction"));
+        assert!(formatted.contains("caps_r=keyTarget_no_such_key"));
+        assert!(formatted.contains("caps_c=keyCombo_ctrl_no_such_key"));
+        assert!(formatted.contains("invalid key function count"));
+    }
+
+    #[test]
+    fn settings_model_save_validation_rejects_error_config() {
+        let mapping = Config::from_ini("[Keys]\ncaps_h=keyFunc_moveLeft\n")
+            .unwrap()
+            .capslock_layer
+            .remove(0);
+        let mut model = SettingsModel::from_config(&Config::default());
+        model.capslock_layer = vec![mapping.clone(), mapping];
+
+        let report = model.validate_for_save();
+        let formatted = report.format_for_language(Language::ZhCn);
+
+        assert!(report.has_errors());
+        assert_eq!(report.expected_mapping_count, 2);
+        assert_eq!(report.parsed_mapping_count, 1);
+        assert!(has_validation_issue(
+            &report,
+            ConfigIssueKind::DuplicateMapping
+        ));
+        assert!(formatted.contains("校验失败"));
+        assert!(formatted.contains("caps_h=keyFunc_moveLeft"));
+    }
+
+    #[test]
     fn default_added_binding_uses_first_free_key_choice() {
         let model = SettingsModel::from_config(&Config::default());
 
         assert_ne!(next_default_source(&model), "caps_space");
+    }
+
+    fn has_validation_issue(report: &SettingsValidationReport, kind: ConfigIssueKind) -> bool {
+        report
+            .validation
+            .issues
+            .iter()
+            .any(|issue| issue.kind == kind)
     }
 }

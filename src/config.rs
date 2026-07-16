@@ -1633,6 +1633,44 @@ mod tests {
     }
 
     #[test]
+    fn reports_unknown_action_variants_and_invalid_action_params() {
+        let result = Config::from_ini_with_validation(
+            r#"
+            [Keys]
+            caps_j=keyFunc_noSuchAction
+            caps_r=keyTarget_no_such_key
+            caps_c=keyCombo_ctrl_no_such_key
+            caps_d=keyFunc_moveLeft(nope)
+            "#,
+        );
+
+        assert!(!result.validation.has_errors());
+        let unknown_actions: Vec<&ConfigIssue> = result
+            .validation
+            .issues
+            .iter()
+            .filter(|issue| issue.kind == ConfigIssueKind::UnknownAction)
+            .collect();
+        assert_eq!(unknown_actions.len(), 4);
+        assert!(unknown_actions.iter().any(|issue| {
+            issue.key.as_deref() == Some("caps_j")
+                && issue.value.as_deref() == Some("keyFunc_noSuchAction")
+        }));
+        assert!(unknown_actions.iter().any(|issue| {
+            issue.key.as_deref() == Some("caps_r")
+                && issue.message.contains("unsupported target key action")
+        }));
+        assert!(unknown_actions.iter().any(|issue| {
+            issue.key.as_deref() == Some("caps_c")
+                && issue.message.contains("unsupported target combo action")
+        }));
+        assert!(unknown_actions.iter().any(|issue| {
+            issue.key.as_deref() == Some("caps_d")
+                && issue.message.contains("invalid key function count")
+        }));
+    }
+
+    #[test]
     fn preserves_case_for_unparsed_string_values() {
         let config = Config::from_ini(
             r#"

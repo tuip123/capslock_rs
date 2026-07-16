@@ -116,7 +116,11 @@ pub fn save_settings_model(model: &SettingsModel) -> Result<(), String> {
     model.apply_to_config(&mut config);
 
     // Round-trip through the parser before writing so the GUI keeps Config as the rule source.
-    Config::from_ini(&config.to_ini_string())?;
+    let validation = gui_settings::validate_config_for_save(&config, model.capslock_layer.len());
+    if validation.has_errors() {
+        return Err(validation.format_for_language(model.language));
+    }
+
     config.save(&context.config_path)?;
     reload_config();
     Ok(())
