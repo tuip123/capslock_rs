@@ -18,8 +18,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{
-    Config, ConfigIssue, ConfigIssueKind, ConfigIssueSeverity, ConfigValidation, KeyMapping,
-    Language, LayerAction, TapCapsLock,
+    Config, ConfigIssue, ConfigIssueKind, ConfigIssueSeverity, ConfigParseResult, ConfigValidation,
+    KeyMapping, Language, LayerAction, TapCapsLock,
 };
 use crate::hook::{KeyCaptureMode, KeyCaptureOutcome, KeyCaptureRejectReason};
 use crate::keys::{parse_capslock_combo_name, parse_combo_suffix, KeyCombo};
@@ -34,6 +34,7 @@ pub struct SettingsModel {
     pub tap_capslock: TapCapsLock,
     pub language: Language,
     pub capslock_layer: Vec<KeyMapping>,
+    binding_rows: Vec<KeyBindingRow>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +56,21 @@ pub struct KeyBindingRow {
     pub source: String,
     pub action_kind: KeyBindingActionKind,
     pub action_value: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyBindingRowStatus {
+    Normal,
+    DuplicateMapping,
+    InvalidInputCombo,
+    UnknownAction,
+    ConfigError,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BindingRowIniEntry {
+    key: String,
+    value: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -291,6 +307,11 @@ static WINDOW_STATE: OnceLock<Mutex<Option<SettingsWindowState>>> = OnceLock::ne
 
 impl SettingsModel {
     pub fn from_config(config: &Config) -> Self {
+        let binding_rows: Vec<KeyBindingRow> = config
+            .capslock_layer
+            .iter()
+            .map(KeyBindingRow::from_mapping)
+            .collect();
         Self {
             enabled: config.general.enabled,
             start_with_windows: config.general.start_with_windows,
@@ -299,7 +320,19 @@ impl SettingsModel {
             tap_capslock: config.general.tap_capslock,
             language: config.ui.language,
             capslock_layer: config.capslock_layer.clone(),
+            binding_rows,
         }
+    }
+
+    pub fn from_parse_result(result: &ConfigParseResult) -> Self {
+        let mut model = Self::from_config(&result.config);
+        for issue in &result.validation.issues {
+            if let Some(row) = KeyBindingRow::from_config_issue(issue) {
+                model.binding_rows.push(row);
+            }
+        }
+        model.refresh_parsed_bindings();
+        model
     }
 
     pub fn apply_to_config(&self, config: &mut Config) {
@@ -309,13 +342,11 @@ impl SettingsModel {
         config.general.show_tray_icon = self.show_tray_icon;
         config.general.tap_capslock = self.tap_capslock;
         config.ui.language = self.language;
-        config.capslock_layer = self.capslock_layer.clone();
+        config.capslock_layer = parse_binding_rows_lossy(&self.binding_rows);
     }
 
     pub fn validate_for_save(&self) -> SettingsValidationReport {
-        let mut config = Config::default();
-        self.apply_to_config(&mut config);
-        validate_config_for_save(&config, self.capslock_layer.len())
+        validate_binding_rows_for_save(&self.binding_rows)
     }
 }
 
@@ -338,6 +369,7 @@ impl SettingsValidationReport {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn validate_config_for_save(
     config: &Config,
     expected_mapping_count: usize,
@@ -347,14 +379,20 @@ pub(crate) fn validate_config_for_save(
 
 impl SettingsModel {
     pub fn binding_rows(&self) -> Vec<KeyBindingRow> {
-        self.capslock_layer
-            .iter()
-            .map(KeyBindingRow::from_mapping)
-            .collect()
+        self.binding_rows.clone()
+    }
+
+    pub fn binding_row_count(&self) -> usize {
+        self.binding_rows.len()
+    }
+
+    pub fn binding_row_statuses(&self) -> Vec<KeyBindingRowStatus> {
+        binding_row_statuses_for_rows(&self.binding_rows)
     }
 
     pub fn replace_binding_rows(&mut self, rows: Vec<KeyBindingRow>) -> Result<(), String> {
-        self.capslock_layer = parse_binding_rows(&rows)?;
+        self.binding_rows = rows;
+        self.refresh_parsed_bindings();
         Ok(())
     }
 
@@ -380,6 +418,10 @@ impl SettingsModel {
         }
         rows.remove(index);
         self.replace_binding_rows(rows)
+    }
+
+    fn refresh_parsed_bindings(&mut self) {
+        self.capslock_layer = parse_binding_rows_lossy(&self.binding_rows);
     }
 }
 
@@ -411,6 +453,38 @@ impl KeyBindingRow {
             action_kind,
             action_value,
         }
+    }
+
+    fn from_config_issue(issue: &ConfigIssue) -> Option<Self> {
+        if !is_binding_row_issue(issue) {
+            return None;
+        }
+        let key = issue.key.as_ref()?;
+        let value = issue.value.as_ref()?;
+        Some(Self::from_ini_pair(key, value))
+    }
+
+    fn from_ini_pair(key: &str, value: &str) -> Self {
+        let (action_kind, action_value) = if has_ascii_case_prefix(value, "keyFunc_") {
+            (
+                KeyBindingActionKind::BuiltIn,
+                strip_ascii_case_prefix(value, "keyFunc_").to_string(),
+            )
+        } else if has_ascii_case_prefix(value, "keyTarget_") {
+            (
+                KeyBindingActionKind::KeyTap,
+                strip_ascii_case_prefix(value, "keyTarget_").to_string(),
+            )
+        } else if has_ascii_case_prefix(value, "keyCombo_") {
+            (
+                KeyBindingActionKind::KeyCombo,
+                strip_ascii_case_prefix(value, "keyCombo_").to_string(),
+            )
+        } else {
+            (KeyBindingActionKind::BuiltIn, value.to_string())
+        };
+
+        Self::new(key, action_kind, action_value)
     }
 
     fn source_ini_key(&self) -> Result<String, String> {
@@ -459,47 +533,56 @@ impl KeyBindingActionKind {
     }
 }
 
-fn parse_binding_rows(rows: &[KeyBindingRow]) -> Result<Vec<KeyMapping>, String> {
+fn parse_binding_rows_lossy(rows: &[KeyBindingRow]) -> Vec<KeyMapping> {
     if rows.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
-    let content = binding_rows_ini(rows)?;
-
-    // Use the real config parser so GUI validation cannot drift from INI semantics.
-    let parsed = Config::from_ini_with_validation(&content);
-    let report = settings_validation_report(
-        parsed.validation.clone(),
-        rows.len(),
-        parsed.config.capslock_layer.len(),
-    );
-    if !report.validation.issues.is_empty() {
-        return Err(report.format_for_language(Language::EnUs));
-    }
-    if parsed.config.capslock_layer.len() != rows.len() {
-        return Err("some binding rows were ignored by the config parser".to_string());
-    }
-
-    Ok(parsed.config.capslock_layer)
+    let Ok(content) = binding_rows_ini(rows) else {
+        return Vec::new();
+    };
+    Config::from_ini_with_validation(&content)
+        .config
+        .capslock_layer
 }
 
-#[cfg(test)]
-fn validate_binding_rows_for_save(
-    rows: &[KeyBindingRow],
-) -> Result<SettingsValidationReport, String> {
-    let content = binding_rows_ini(rows)?;
-    Ok(settings_validation_report_from_ini(&content, rows.len()))
+fn validate_binding_rows_for_save(rows: &[KeyBindingRow]) -> SettingsValidationReport {
+    let Ok(content) = binding_rows_ini(rows) else {
+        return settings_validation_report_from_error(
+            ConfigIssueKind::Syntax,
+            "failed to render binding rows as INI",
+            rows.len(),
+        );
+    };
+    settings_validation_report_from_ini(&content, rows.len())
 }
 
 fn binding_rows_ini(rows: &[KeyBindingRow]) -> Result<String, String> {
+    Ok(binding_rows_ini_from_entries(&binding_row_ini_entries(
+        rows,
+    )?))
+}
+
+fn binding_row_ini_entries(rows: &[KeyBindingRow]) -> Result<Vec<BindingRowIniEntry>, String> {
+    rows.iter()
+        .map(|row| {
+            Ok(BindingRowIniEntry {
+                key: row.source_ini_key()?,
+                value: row.action_ini_value()?,
+            })
+        })
+        .collect()
+}
+
+fn binding_rows_ini_from_entries(entries: &[BindingRowIniEntry]) -> String {
     let mut content = String::from("[Keys]\n");
-    for row in rows {
-        content.push_str(&row.source_ini_key()?);
+    for entry in entries {
+        content.push_str(&entry.key);
         content.push('=');
-        content.push_str(&row.action_ini_value()?);
+        content.push_str(&entry.value);
         content.push('\n');
     }
-    Ok(content)
+    content
 }
 
 fn settings_validation_report_from_ini(
@@ -542,6 +625,28 @@ fn settings_validation_report(
     }
 }
 
+fn settings_validation_report_from_error(
+    kind: ConfigIssueKind,
+    message: impl Into<String>,
+    expected_mapping_count: usize,
+) -> SettingsValidationReport {
+    settings_validation_report(
+        ConfigValidation {
+            issues: vec![ConfigIssue {
+                severity: ConfigIssueSeverity::Error,
+                kind,
+                line: None,
+                section: Some("keys".to_string()),
+                key: None,
+                value: None,
+                message: message.into(),
+            }],
+        },
+        expected_mapping_count,
+        0,
+    )
+}
+
 fn settings_issue_blocks_save(issue: &ConfigIssue) -> bool {
     issue.severity == ConfigIssueSeverity::Error
         || matches!(
@@ -550,6 +655,145 @@ fn settings_issue_blocks_save(issue: &ConfigIssue) -> bool {
                 | ConfigIssueKind::InvalidMapping
                 | ConfigIssueKind::UnknownAction
         )
+}
+
+fn is_binding_row_issue(issue: &ConfigIssue) -> bool {
+    matches!(
+        issue.kind,
+        ConfigIssueKind::DuplicateMapping
+            | ConfigIssueKind::InvalidMapping
+            | ConfigIssueKind::UnknownAction
+    ) && issue
+        .section
+        .as_deref()
+        .map(|section| section.eq_ignore_ascii_case("keys"))
+        .unwrap_or(false)
+}
+
+fn binding_row_statuses_for_rows(rows: &[KeyBindingRow]) -> Vec<KeyBindingRowStatus> {
+    let mut statuses = vec![KeyBindingRowStatus::Normal; rows.len()];
+    let Ok(entries) = binding_row_ini_entries(rows) else {
+        return vec![KeyBindingRowStatus::ConfigError; rows.len()];
+    };
+    let content = binding_rows_ini_from_entries(&entries);
+    let report = settings_validation_report_from_ini(&content, rows.len());
+
+    for issue in &report.validation.issues {
+        apply_issue_to_row_statuses(issue, rows, &entries, &mut statuses);
+    }
+    mark_unparsed_normal_rows(rows, &mut statuses);
+
+    statuses
+}
+
+fn mark_unparsed_normal_rows(rows: &[KeyBindingRow], statuses: &mut [KeyBindingRowStatus]) {
+    for (row, status) in rows.iter().zip(statuses.iter_mut()) {
+        if *status == KeyBindingRowStatus::Normal
+            && parse_binding_rows_lossy(std::slice::from_ref(row)).len() != 1
+        {
+            *status = KeyBindingRowStatus::ConfigError;
+        }
+    }
+}
+
+fn apply_issue_to_row_statuses(
+    issue: &ConfigIssue,
+    rows: &[KeyBindingRow],
+    entries: &[BindingRowIniEntry],
+    statuses: &mut [KeyBindingRowStatus],
+) {
+    let status = KeyBindingRowStatus::from_issue(issue);
+    if status == KeyBindingRowStatus::Normal {
+        return;
+    }
+
+    if issue.kind == ConfigIssueKind::DuplicateMapping {
+        if let Some(index) = row_index_for_issue(issue, entries) {
+            if let Some(source) = normalized_row_source(&rows[index]) {
+                for (row_index, row) in rows.iter().enumerate() {
+                    if normalized_row_source(row).as_deref() == Some(source.as_str()) {
+                        statuses[row_index] = statuses[row_index].merge(status);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    if let Some(index) = row_index_for_issue(issue, entries) {
+        statuses[index] = statuses[index].merge(status);
+        return;
+    }
+
+    if issue.line.is_none() && issue.key.is_none() {
+        for row_status in statuses {
+            *row_status = row_status.merge(KeyBindingRowStatus::ConfigError);
+        }
+    }
+}
+
+fn row_index_for_issue(issue: &ConfigIssue, entries: &[BindingRowIniEntry]) -> Option<usize> {
+    if let Some(line) = issue.line {
+        let index = line.checked_sub(2)?;
+        if index < entries.len() {
+            return Some(index);
+        }
+    }
+
+    let key = issue.key.as_ref()?;
+    entries
+        .iter()
+        .position(|entry| entry.key.eq_ignore_ascii_case(key))
+}
+
+fn normalized_row_source(row: &KeyBindingRow) -> Option<String> {
+    let source = row.source_ini_key().ok()?;
+    parse_capslock_combo_name(&source)
+        .ok()
+        .map(|combo| combo.capslock_ini_key())
+}
+
+impl KeyBindingRowStatus {
+    fn from_issue(issue: &ConfigIssue) -> Self {
+        match issue.kind {
+            ConfigIssueKind::DuplicateMapping => Self::DuplicateMapping,
+            ConfigIssueKind::InvalidMapping if issue.line.is_some() || issue.key.is_some() => {
+                Self::InvalidInputCombo
+            }
+            ConfigIssueKind::UnknownAction => Self::UnknownAction,
+            ConfigIssueKind::Syntax
+            | ConfigIssueKind::InvalidValue
+            | ConfigIssueKind::InvalidMapping => Self::ConfigError,
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        if other.priority() > self.priority() {
+            other
+        } else {
+            self
+        }
+    }
+
+    fn priority(self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::DuplicateMapping => 1,
+            Self::UnknownAction => 2,
+            Self::InvalidInputCombo => 3,
+            Self::ConfigError => 4,
+        }
+    }
+
+    fn i18n_key(self) -> &'static str {
+        match self {
+            Self::Normal => "settings.binding.status.normal",
+            Self::DuplicateMapping => "settings.binding.status.duplicate_mapping",
+            Self::InvalidInputCombo => "settings.binding.status.invalid_input_combo",
+            Self::UnknownAction => "settings.binding.status.unknown_action",
+            Self::ConfigError => "settings.binding.status.config_error",
+        }
+    }
 }
 
 fn format_settings_validation_report(
@@ -947,7 +1191,7 @@ fn add_default_binding_from_list_result() -> Result<(), String> {
         KeyBindingActionKind::BuiltIn,
         default_action_value(KeyBindingActionKind::BuiltIn),
     ))?;
-    state.selected_binding_index = state.model.capslock_layer.len().checked_sub(1);
+    state.selected_binding_index = state.model.binding_row_count().checked_sub(1);
     Ok(())
 }
 
@@ -983,7 +1227,7 @@ fn delete_selected_binding_result() -> Result<(), String> {
     };
 
     state.model.delete_binding_row(index)?;
-    let len = state.model.capslock_layer.len();
+    let len = state.model.binding_row_count();
     state.selected_binding_index = if len == 0 {
         None
     } else {
@@ -998,7 +1242,7 @@ fn change_selected_binding(hwnd: HWND) {
             set_selected_binding_index(None)?;
             return populate_binding_editor(hwnd);
         };
-        let row_count = with_state(|state| state.model.capslock_layer.len())?;
+        let row_count = with_state(|state| state.model.binding_row_count())?;
         if new_index >= row_count {
             add_default_binding_from_list(hwnd);
             return Ok(());
@@ -1489,7 +1733,7 @@ fn current_bindings_view() -> Result<(SettingsModel, Option<usize>), String> {
     let state = state
         .as_mut()
         .ok_or_else(|| "settings window is not initialized".to_string())?;
-    let len = state.model.capslock_layer.len();
+    let len = state.model.binding_row_count();
     if state
         .selected_binding_index
         .map(|index| index >= len)
@@ -1511,8 +1755,10 @@ fn populate_binding_list(
         SendMessageW(control, LB_RESETCONTENT, 0, 0);
     }
 
-    for row in model.binding_rows() {
-        let item = win::to_wide_null(&binding_list_text(language, &row));
+    let rows = model.binding_rows();
+    let statuses = model.binding_row_statuses();
+    for (row, status) in rows.iter().zip(statuses.iter().copied()) {
+        let item = win::to_wide_null(&binding_list_text(language, row, status));
         unsafe {
             SendMessageW(control, LB_ADDSTRING, 0, item.as_ptr() as LPARAM);
         }
@@ -1775,10 +2021,15 @@ fn populate_binding_action_kind(
     populate_combo(hwnd, ID_BINDING_ACTION_KIND, &items, selected.combo_index())
 }
 
-fn binding_list_text(language: Language, row: &KeyBindingRow) -> String {
+fn binding_list_text(
+    language: Language,
+    row: &KeyBindingRow,
+    status: KeyBindingRowStatus,
+) -> String {
     format!(
-        "{} | {} | {}",
+        "{} | {} | {} | {}",
         row.source,
+        i18n::text(language, status.i18n_key()),
         binding_action_kind_text(language, row.action_kind),
         row.action_value
     )
@@ -2328,7 +2579,7 @@ mod tests {
     #[test]
     fn settings_model_adds_updates_and_deletes_binding_rows() {
         let mut model = SettingsModel::from_config(&Config::default());
-        let original_len = model.capslock_layer.len();
+        let original_len = model.binding_row_count();
 
         model
             .add_binding_row(KeyBindingRow::new(
@@ -2338,13 +2589,13 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(model.capslock_layer.len(), original_len + 1);
+        assert_eq!(model.binding_row_count(), original_len + 1);
         assert_eq!(
             model.binding_rows().last().unwrap(),
             &KeyBindingRow::new("caps_r", KeyBindingActionKind::KeyTap, "f5")
         );
 
-        let index = model.capslock_layer.len() - 1;
+        let index = model.binding_row_count() - 1;
         model
             .update_binding_row(
                 index,
@@ -2366,7 +2617,7 @@ mod tests {
         );
 
         model.delete_binding_row(index).unwrap();
-        assert_eq!(model.capslock_layer.len(), original_len);
+        assert_eq!(model.binding_row_count(), original_len);
     }
 
     #[test]
@@ -2497,7 +2748,7 @@ mod tests {
             KeyBindingRow::new("caps_lctrl_ctrl_j", KeyBindingActionKind::BuiltIn, "moveUp"),
         ];
 
-        let report = validate_binding_rows_for_save(&rows).unwrap();
+        let report = validate_binding_rows_for_save(&rows);
 
         assert!(report.has_errors());
         assert!(has_validation_issue(
@@ -2525,7 +2776,7 @@ mod tests {
             KeyBindingRow::new("caps_d", KeyBindingActionKind::BuiltIn, "moveLeft(nope)"),
         ];
 
-        let report = validate_binding_rows_for_save(&rows).unwrap();
+        let report = validate_binding_rows_for_save(&rows);
         let formatted = report.format_for_language(Language::EnUs);
 
         assert!(report.has_errors());
@@ -2547,12 +2798,13 @@ mod tests {
 
     #[test]
     fn settings_model_save_validation_rejects_error_config() {
-        let mapping = Config::from_ini("[Keys]\ncaps_h=keyFunc_moveLeft\n")
-            .unwrap()
-            .capslock_layer
-            .remove(0);
         let mut model = SettingsModel::from_config(&Config::default());
-        model.capslock_layer = vec![mapping.clone(), mapping];
+        model
+            .replace_binding_rows(vec![
+                KeyBindingRow::new("caps_h", KeyBindingActionKind::BuiltIn, "moveLeft"),
+                KeyBindingRow::new("caps_h", KeyBindingActionKind::BuiltIn, "moveRight"),
+            ])
+            .unwrap();
 
         let report = model.validate_for_save();
         let formatted = report.format_for_language(Language::ZhCn);
@@ -2565,7 +2817,51 @@ mod tests {
             ConfigIssueKind::DuplicateMapping
         ));
         assert!(formatted.contains("校验失败"));
-        assert!(formatted.contains("caps_h=keyFunc_moveLeft"));
+        assert!(formatted.contains("caps_h=keyFunc_moveRight"));
+    }
+
+    #[test]
+    fn binding_row_statuses_cover_validation_states() {
+        let rows = vec![
+            KeyBindingRow::new("caps_h", KeyBindingActionKind::BuiltIn, "moveLeft"),
+            KeyBindingRow::new("caps_h", KeyBindingActionKind::BuiltIn, "moveRight"),
+            KeyBindingRow::new("caps_lctrl_ctrl_j", KeyBindingActionKind::BuiltIn, "moveUp"),
+            KeyBindingRow::new("caps_r", KeyBindingActionKind::KeyTap, "no_such_key"),
+            KeyBindingRow::new("caps_q", KeyBindingActionKind::BuiltIn, "doNothing"),
+        ];
+
+        let statuses = binding_row_statuses_for_rows(&rows);
+
+        assert_eq!(statuses[0], KeyBindingRowStatus::DuplicateMapping);
+        assert_eq!(statuses[1], KeyBindingRowStatus::DuplicateMapping);
+        assert_eq!(statuses[2], KeyBindingRowStatus::InvalidInputCombo);
+        assert_eq!(statuses[3], KeyBindingRowStatus::UnknownAction);
+        assert_eq!(statuses[4], KeyBindingRowStatus::ConfigError);
+    }
+
+    #[test]
+    fn binding_list_text_uses_localized_status() {
+        let row = KeyBindingRow::new("caps_h", KeyBindingActionKind::BuiltIn, "moveLeft");
+
+        let text = binding_list_text(Language::ZhCn, &row, KeyBindingRowStatus::Normal);
+
+        assert!(text.contains("正常"));
+        assert!(text.contains("caps_h"));
+    }
+
+    #[test]
+    fn parse_result_adds_validation_issue_rows_to_settings_model() {
+        let result = Config::from_ini_with_validation(
+            "[Keys]\ncaps_h=keyFunc_moveLeft\ncaps_h=keyFunc_moveRight\ncaps_r=keyTarget_no_such_key\n",
+        );
+
+        let model = SettingsModel::from_parse_result(&result);
+        let statuses = model.binding_row_statuses();
+
+        assert_eq!(model.binding_row_count(), 3);
+        assert_eq!(statuses[0], KeyBindingRowStatus::DuplicateMapping);
+        assert_eq!(statuses[1], KeyBindingRowStatus::DuplicateMapping);
+        assert_eq!(statuses[2], KeyBindingRowStatus::UnknownAction);
     }
 
     #[test]

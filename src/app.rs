@@ -96,13 +96,26 @@ pub fn settings_snapshot() -> Result<SettingsSnapshot, String> {
     let context = APP_CONTEXT
         .get()
         .ok_or_else(|| "app context is not initialized".to_string())?;
-    let runtime = context
-        .runtime
-        .lock()
-        .map_err(|_| "runtime state lock is poisoned".to_string())?;
+    let runtime_config = {
+        let runtime = context
+            .runtime
+            .lock()
+            .map_err(|_| "runtime state lock is poisoned".to_string())?;
+        runtime.config.clone()
+    };
+
+    let model = match Config::load_with_validation(&context.config_path) {
+        Ok(result) => SettingsModel::from_parse_result(&result),
+        Err(error) => {
+            logging::log_line(format!(
+                "failed to load settings validation snapshot: {error}"
+            ));
+            SettingsModel::from_config(&runtime_config)
+        }
+    };
 
     Ok(SettingsSnapshot {
-        model: SettingsModel::from_config(&runtime.config),
+        model,
         config_path: context.config_path.clone(),
         log_path: context.log_path.clone(),
     })
@@ -112,15 +125,15 @@ pub fn save_settings_model(model: &SettingsModel) -> Result<(), String> {
     let context = APP_CONTEXT
         .get()
         .ok_or_else(|| "app context is not initialized".to_string())?;
-    let mut config = current_config()?;
-    model.apply_to_config(&mut config);
 
-    // Round-trip through the parser before writing so the GUI keeps Config as the rule source.
-    let validation = gui_settings::validate_config_for_save(&config, model.capslock_layer.len());
+    // Round-trip editable rows through the parser before writing so GUI rules cannot drift.
+    let validation = model.validate_for_save();
     if validation.has_errors() {
         return Err(validation.format_for_language(model.language));
     }
 
+    let mut config = current_config()?;
+    model.apply_to_config(&mut config);
     config.save(&context.config_path)?;
     reload_config();
     Ok(())

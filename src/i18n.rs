@@ -51,6 +51,17 @@ const EN_US: &[(&str, &str)] = &[
     ("settings.binding.type.builtin", "Built-in function"),
     ("settings.binding.type.key_tap", "Output key"),
     ("settings.binding.type.key_combo", "Output combo"),
+    ("settings.binding.status.normal", "Normal"),
+    (
+        "settings.binding.status.duplicate_mapping",
+        "Duplicate mapping",
+    ),
+    (
+        "settings.binding.status.invalid_input_combo",
+        "Invalid input combo",
+    ),
+    ("settings.binding.status.unknown_action", "Unknown action"),
+    ("settings.binding.status.config_error", "Config error"),
     ("settings.binding_added", "Binding added to list."),
     ("settings.binding_updated", "Binding updated in list."),
     ("settings.binding_deleted", "Binding deleted from list."),
@@ -162,6 +173,14 @@ const ZH_CN: &[(&str, &str)] = &[
     ("settings.binding.type.builtin", "内置函数"),
     ("settings.binding.type.key_tap", "输出单键"),
     ("settings.binding.type.key_combo", "输出组合键"),
+    ("settings.binding.status.normal", "正常"),
+    ("settings.binding.status.duplicate_mapping", "重复映射"),
+    (
+        "settings.binding.status.invalid_input_combo",
+        "非法输入组合",
+    ),
+    ("settings.binding.status.unknown_action", "未知动作"),
+    ("settings.binding.status.config_error", "配置错误"),
     ("settings.binding_added", "已新增到列表。"),
     ("settings.binding_updated", "已更新列表项。"),
     ("settings.binding_deleted", "已从列表删除。"),
@@ -352,6 +371,18 @@ mod tests {
         assert_eq!(en_us_keys, zh_cn_keys);
         assert_eq!(en_us_keys.len(), EN_US.len(), "en-US has duplicate keys");
         assert_eq!(zh_cn_keys.len(), ZH_CN.len(), "zh-CN has duplicate keys");
+    }
+
+    #[test]
+    fn binding_status_translation_keys_are_localized() {
+        assert_eq!(
+            text(Language::ZhCn, "settings.binding.status.normal"),
+            "正常"
+        );
+        assert_eq!(
+            text(Language::EnUs, "settings.binding.status.config_error"),
+            "Config error"
+        );
     }
 
     #[test]
