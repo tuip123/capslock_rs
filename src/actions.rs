@@ -80,6 +80,7 @@ fn send_builtin_action(action: BuiltInAction) {
         BuiltInAction::ForwardDeleteWord(count) => {
             send_repeated_key(VK_DELETE, count, &[KeyModifier::Ctrl])
         }
+        BuiltInAction::DeleteLine(count) => send_delete_line(count),
     }
 }
 
@@ -101,6 +102,18 @@ fn send_repeated_key(vk: u16, count: u32, modifiers: &[KeyModifier]) {
             send_key_tap(vk);
         }
     });
+}
+
+fn send_delete_line(count: u32) {
+    for _ in 0..count.max(1) {
+        send_key_tap(VK_HOME);
+        send_with_modifiers(&[KeyModifier::Shift], || {
+            // Select the current line and its trailing line break when one exists.
+            send_key_tap(VK_END);
+            send_key_tap(VK_RIGHT);
+        });
+        send_key_tap(VK_BACK);
+    }
 }
 
 fn send_with_modifiers(modifiers: &[KeyModifier], action: impl FnOnce()) {

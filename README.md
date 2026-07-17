@@ -87,6 +87,7 @@ caps_l=keyFunc_moveRight
 caps_space=keyFunc_enter
 caps_q=keyFunc_backspace
 caps_e=keyFunc_delete
+caps_backspace=keyFunc_deleteLine
 caps_z=keyFunc_moveUp(5)
 caps_x=keyFunc_moveDown(5)
 caps_lalt_a=keyFunc_moveWordLeft
@@ -151,6 +152,7 @@ caps_ctrl_shift_h=keyCombo_ctrl_shift_left
 | `keyFunc_delete(n)` | Delete `n` 次 |
 | `keyFunc_deleteWord(n)` | Ctrl + Backspace `n` 次 |
 | `keyFunc_forwardDeleteWord(n)` | Ctrl + Delete `n` 次 |
+| `keyFunc_deleteLine(n)` | 删除当前整行 `n` 次 |
 
 兼容说明：已有 INI 中的 `keyFunc_doNothing`、`none`、`off` 或 `disabled` 会被当作禁用该条映射并跳过，不作为 GUI 可新增的内置动作保存。
 

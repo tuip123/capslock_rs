@@ -303,6 +303,7 @@ const BUILTIN_ACTION_CHOICES: &[&str] = &[
     "delete",
     "deleteWord",
     "forwardDeleteWord",
+    "deleteLine",
 ];
 
 static CLASS_REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
@@ -2987,6 +2988,7 @@ mod tests {
             "moveLeft(12)"
         );
         assert_eq!(builtin_action_value("moveLeft", "1").unwrap(), "moveLeft");
+        assert!(BUILTIN_ACTION_CHOICES.contains(&"deleteLine"));
 
         let parsed = builtin_editor_value("moveDown(7)");
         assert_eq!(parsed.name, "moveDown");

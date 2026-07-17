@@ -107,7 +107,7 @@ caps_lalt_d=keyFunc_moveWordRight
 - `selectLeft(n)`、`selectRight(n)`、`selectUp(n)`、`selectDown(n)`。
 - `selectWordLeft(n)`、`selectWordRight(n)`。
 - `home`、`end`、`pageUp`、`pageDown`。
-- `deleteWord` 和 `forwardDeleteWord`。
+- `deleteWord`、`forwardDeleteWord` 和 `deleteLine`。
 - 可复用的按键按下、释放和点击执行器。
 
 ### 稳定性要求

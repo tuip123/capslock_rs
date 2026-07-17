@@ -107,6 +107,7 @@ pub enum BuiltInAction {
     Delete(u32),
     DeleteWord(u32),
     ForwardDeleteWord(u32),
+    DeleteLine(u32),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -350,6 +351,10 @@ impl Default for Config {
                 KeyMapping::new("space", LayerAction::builtin(BuiltInAction::Enter(1))),
                 KeyMapping::new("q", LayerAction::builtin(BuiltInAction::Backspace(1))),
                 KeyMapping::new("e", LayerAction::builtin(BuiltInAction::Delete(1))),
+                KeyMapping::new(
+                    "backspace",
+                    LayerAction::builtin(BuiltInAction::DeleteLine(1)),
+                ),
                 KeyMapping::new("z", LayerAction::builtin(BuiltInAction::MoveUp(5))),
                 KeyMapping::new("x", LayerAction::builtin(BuiltInAction::MoveDown(5))),
                 KeyMapping::new(
@@ -597,6 +602,7 @@ impl BuiltInAction {
             BuiltInAction::ForwardDeleteWord(count) => {
                 key_func_with_count("forwardDeleteWord", count)
             }
+            BuiltInAction::DeleteLine(count) => key_func_with_count("deleteLine", count),
         }
     }
 }
@@ -1158,6 +1164,7 @@ fn parse_builtin_action(value: &str) -> Result<BuiltInAction, String> {
         "delete" | "del" => BuiltInAction::Delete(count),
         "deleteword" => BuiltInAction::DeleteWord(count),
         "forwarddeleteword" => BuiltInAction::ForwardDeleteWord(count),
+        "deleteline" => BuiltInAction::DeleteLine(count),
         _ => return Err(format!("unsupported key action: {value}")),
     };
 
@@ -1337,6 +1344,7 @@ mod tests {
             [Keys]
             caps_q=keyFunc_backspace
             caps_e=keyFunc_delete
+            caps_backspace=keyFunc_deleteLine(2)
             caps_w=keyFunc_moveUp(1)
             caps_a=keyFunc_moveLeft(1)
             caps_s=keyFunc_moveDown(1)
@@ -1354,6 +1362,10 @@ mod tests {
         assert_eq!(
             find_action(&config, "q"),
             Some(LayerAction::BuiltIn(BuiltInAction::Backspace(1)))
+        );
+        assert_eq!(
+            find_action(&config, "backspace"),
+            Some(LayerAction::BuiltIn(BuiltInAction::DeleteLine(2)))
         );
         assert_eq!(
             find_action(&config, "z"),
@@ -1549,11 +1561,16 @@ mod tests {
     fn parses_editing_actions_and_keys() {
         let home = parse_layer_action("keyFunc_home").unwrap().unwrap();
         let page_down = parse_layer_action("keyTarget_page_down").unwrap().unwrap();
+        let delete_line = parse_layer_action("keyFunc_deleteLine").unwrap().unwrap();
         let combo = parse_layer_action("keyCombo_rctrl_shift_pageup")
             .unwrap()
             .unwrap();
 
         assert_eq!(home, LayerAction::BuiltIn(BuiltInAction::Home(1)));
+        assert_eq!(
+            delete_line,
+            LayerAction::BuiltIn(BuiltInAction::DeleteLine(1))
+        );
         assert_eq!(
             page_down,
             LayerAction::KeyTap(parse_key_code("page_down").unwrap())
@@ -1578,6 +1595,10 @@ mod tests {
         let config = Config::from_ini(include_str!("../examples/capslock_rs.example.ini")).unwrap();
 
         assert!(config.capslock_layer.len() >= 30);
+        assert_eq!(
+            find_action(&config, "backspace"),
+            Some(LayerAction::BuiltIn(BuiltInAction::DeleteLine(1)))
+        );
         assert_eq!(
             find_action(&config, "m"),
             Some(LayerAction::KeyTap(
