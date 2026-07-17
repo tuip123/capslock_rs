@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -132,11 +132,24 @@ pub fn save_settings_model(model: &SettingsModel) -> Result<(), String> {
         return Err(validation.format_for_language(model.language));
     }
 
-    let mut config = current_config()?;
+    let runtime_config = current_config()?;
+    let mut config = settings_save_base_config(&context.config_path, &runtime_config);
     model.apply_to_config(&mut config);
     config.save(&context.config_path)?;
     reload_config();
     Ok(())
+}
+
+fn settings_save_base_config(config_path: &Path, runtime_config: &Config) -> Config {
+    match Config::load_with_validation(config_path) {
+        Ok(result) => result.config,
+        Err(error) => {
+            logging::log_line(format!(
+                "failed to load settings save base from disk, using runtime config: {error}"
+            ));
+            runtime_config.clone()
+        }
+    }
 }
 
 pub fn is_enabled() -> bool {
@@ -337,4 +350,59 @@ fn set_message_hwnd(hwnd: HWND) -> Result<(), String> {
         .map_err(|_| "message window lock is poisoned".to_string())?;
     *stored = hwnd as isize;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn settings_save_base_config_prefers_current_disk_config() {
+        let path = unique_test_config_path("disk_base");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let runtime_config = Config::from_ini(
+            "[ui]\nsettings_backend = RuntimeBackend\nsettings_page = RuntimePage\nlanguage = en-US\n",
+        )
+        .unwrap();
+        fs::write(
+            &path,
+            "[ui]\nsettings_backend = DiskBackend\nsettings_page = DiskPage\nlanguage = zh-CN\n",
+        )
+        .unwrap();
+
+        let config = settings_save_base_config(&path, &runtime_config);
+
+        assert_eq!(config.ui.settings_backend, "DiskBackend");
+        assert_eq!(config.ui.settings_page, "DiskPage");
+        assert_eq!(config.ui.language, Language::ZhCn);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn settings_save_base_config_falls_back_to_runtime_config() {
+        let path = unique_test_config_path("missing_base");
+        let runtime_config = Config::from_ini(
+            "[ui]\nsettings_backend = RuntimeBackend\nsettings_page = RuntimePage\nlanguage = en-US\n",
+        )
+        .unwrap();
+
+        let config = settings_save_base_config(&path, &runtime_config);
+
+        assert_eq!(config.ui.settings_backend, "RuntimeBackend");
+        assert_eq!(config.ui.settings_page, "RuntimePage");
+        assert_eq!(config.ui.language, Language::EnUs);
+    }
+
+    fn unique_test_config_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("capslock_rs_{name}_{nonce}"))
+            .join("capslock_rs.ini")
+    }
 }
