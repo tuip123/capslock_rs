@@ -2,6 +2,10 @@
 name = "capslock_rs"
 version = "0.1.0"
 edition = "2021"
+authors = ["tuip123 with codex"]
+description = "A Windows CapsLock keyboard layer with configurable INI mappings."
+license = "Apache-2.0"
+readme = "README.md"
 
 [dependencies]
 windows-sys = { version = "0.59", features = [

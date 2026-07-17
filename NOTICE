@@ -1,0 +1,18 @@
+CapsLock RS
+Copyright 2026 tuip123 with codex
+
+CapsLock RS is an independent Rust implementation of a Windows CapsLock
+keyboard layer. The project is distributed under the Apache License, Version
+2.0.
+
+The product idea, keyboard-layer habits, INI naming style, and some action
+names are inspired by CapsLock+:
+
+  https://github.com/wo52616111/capslock-plus
+
+CapsLock+ is licensed under GPLv2. CapsLock RS is not an official version or
+successor of CapsLock+, and this repository is intended to avoid including
+CapsLock+ source code. If GPLv2-covered source code is introduced later, the
+project license and redistribution terms must be reviewed again before release.
+
+Third-party dependency notices are listed in THIRD_PARTY_NOTICES.md.
