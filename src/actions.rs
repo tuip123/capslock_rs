@@ -17,6 +17,8 @@ use crate::keys::{
 use crate::logging;
 
 pub const SYNTHETIC_EXTRA_INFO: usize = 0x4350_5253;
+const NO_MODIFIERS: &[KeyModifier] = &[];
+const SHIFT_MODIFIER: &[KeyModifier] = &[KeyModifier::Shift];
 
 #[derive(Clone, Debug)]
 pub enum Action {
@@ -106,14 +108,28 @@ fn send_repeated_key(vk: u16, count: u32, modifiers: &[KeyModifier]) {
 
 fn send_delete_line(count: u32) {
     for _ in 0..count.max(1) {
-        send_key_tap(VK_HOME);
-        send_with_modifiers(&[KeyModifier::Shift], || {
-            // Select the current line and its trailing line break when one exists.
-            send_key_tap(VK_END);
-            send_key_tap(VK_RIGHT);
-        });
-        send_key_tap(VK_BACK);
+        for (vk, modifiers) in delete_line_steps() {
+            send_key_tap_with_modifiers(vk, modifiers);
+        }
     }
+}
+
+fn delete_line_steps() -> [(u16, &'static [KeyModifier]); 3] {
+    [
+        (VK_HOME, NO_MODIFIERS),
+        // Select to the next line start so the first character of that line is left untouched.
+        (VK_DOWN, SHIFT_MODIFIER),
+        (VK_BACK, NO_MODIFIERS),
+    ]
+}
+
+fn send_key_tap_with_modifiers(vk: u16, modifiers: &[KeyModifier]) {
+    if modifiers.is_empty() {
+        send_key_tap(vk);
+        return;
+    }
+
+    send_with_modifiers(modifiers, || send_key_tap(vk));
 }
 
 fn send_with_modifiers(modifiers: &[KeyModifier], action: impl FnOnce()) {
@@ -235,6 +251,21 @@ mod tests {
             LayerAction::BuiltIn(BuiltInAction::DeleteWord(1)),
             LayerAction::BuiltIn(BuiltInAction::ForwardDeleteWord(1))
         );
+    }
+
+    #[test]
+    fn delete_line_selects_to_next_line_start() {
+        let steps = delete_line_steps();
+
+        assert_eq!(
+            steps,
+            [
+                (VK_HOME, NO_MODIFIERS),
+                (VK_DOWN, SHIFT_MODIFIER),
+                (VK_BACK, NO_MODIFIERS)
+            ]
+        );
+        assert!(!steps.iter().any(|(vk, _)| *vk == VK_RIGHT));
     }
 
     #[test]
